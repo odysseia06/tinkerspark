@@ -1,0 +1,14 @@
+[package]
+name = "tinkerspark-format-openpgp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tinkerspark-core-types = { workspace = true }
+tinkerspark-core-bytes = { workspace = true }
+tinkerspark-core-analyze = { workspace = true }
+sequoia-openpgp = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }

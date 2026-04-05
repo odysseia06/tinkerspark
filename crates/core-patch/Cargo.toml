@@ -1,0 +1,14 @@
+[package]
+name = "tinkerspark-core-patch"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tinkerspark-core-types = { workspace = true }
+tinkerspark-core-bytes = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tinkerspark-core-bytes = { workspace = true }

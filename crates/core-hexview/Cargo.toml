@@ -1,0 +1,9 @@
+[package]
+name = "tinkerspark-core-hexview"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tinkerspark-core-types = { workspace = true }
+tinkerspark-core-bytes = { workspace = true }

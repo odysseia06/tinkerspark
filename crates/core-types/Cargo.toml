@@ -1,0 +1,10 @@
+[package]
+name = "tinkerspark-core-types"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

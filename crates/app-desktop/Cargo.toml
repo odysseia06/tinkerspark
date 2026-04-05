@@ -1,0 +1,24 @@
+[package]
+name = "tinkerspark-app-desktop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tinkerspark-core-types = { workspace = true }
+tinkerspark-core-bytes = { workspace = true }
+tinkerspark-core-hexview = { workspace = true }
+tinkerspark-core-patch = { workspace = true }
+tinkerspark-core-diff = { workspace = true }
+tinkerspark-core-analyze = { workspace = true }
+tinkerspark-format-openpgp = { workspace = true }
+tinkerspark-infra-io = { workspace = true }
+tinkerspark-infra-session = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_dock = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
