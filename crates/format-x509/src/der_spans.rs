@@ -61,6 +61,15 @@ pub struct ExtensionSpan {
     pub wrapper: ByteRange,
 }
 
+/// Spans for SubjectPublicKeyInfo internals.
+#[derive(Debug)]
+pub struct SpkiSpans {
+    /// The AlgorithmIdentifier SEQUENCE.
+    pub algorithm: ByteRange,
+    /// The subjectPublicKey BIT STRING.
+    pub subject_public_key: ByteRange,
+}
+
 /// Parse a DER length, returning (content_length, header_bytes_consumed).
 fn parse_length(data: &[u8]) -> Option<(usize, usize)> {
     if data.is_empty() {
@@ -308,6 +317,42 @@ pub fn extract_extension_spans(
     }
 
     result
+}
+
+/// Walk inside SubjectPublicKeyInfo to extract AlgorithmIdentifier and
+/// subjectPublicKey spans.
+///
+/// SPKI is: SEQUENCE { AlgorithmIdentifier, BIT STRING }
+pub fn extract_spki_spans(
+    der: &[u8],
+    spki_range: ByteRange,
+    base_offset: u64,
+) -> Option<SpkiSpans> {
+    let start = (spki_range.offset() - base_offset) as usize;
+    let (tag, content_off, content_len, _) = read_tlv(der, start)?;
+    if tag != 0x30 {
+        return None;
+    }
+
+    let mut pos = content_off;
+    let end = content_off + content_len;
+
+    // 1. AlgorithmIdentifier (SEQUENCE)
+    let (_, _, _, alg_total) = read_tlv(der, pos)?;
+    let algorithm = ByteRange::new(base_offset + pos as u64, alg_total as u64);
+    pos += alg_total;
+    if pos > end {
+        return None;
+    }
+
+    // 2. subjectPublicKey (BIT STRING)
+    let (_, _, _, pk_total) = read_tlv(der, pos)?;
+    let subject_public_key = ByteRange::new(base_offset + pos as u64, pk_total as u64);
+
+    Some(SpkiSpans {
+        algorithm,
+        subject_public_key,
+    })
 }
 
 #[cfg(test)]

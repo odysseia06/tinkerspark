@@ -547,6 +547,68 @@ fn parse_unencrypted_private_section(
                     diagnostics: Vec::new(),
                 });
             }
+            binary::KeyFields::Rsa {
+                n,
+                e,
+                d,
+                iqmp,
+                p,
+                q,
+            } => {
+                let mpint_node =
+                    |label: &str, kind: &str, field: &binary::StringField| AnalysisNode {
+                        id: NodeId::new(),
+                        label: format!("{} ({} bytes)", label, field.value.len()),
+                        kind: kind.into(),
+                        range: field.full_span.to_range(base),
+                        children: Vec::new(),
+                        fields: vec![FieldView {
+                            name: "Size".into(),
+                            value: format!("{} bytes", field.value.len()),
+                            range: Some(field.value_span.to_range(base)),
+                        }],
+                        diagnostics: Vec::new(),
+                    };
+                key_children.push(mpint_node("Modulus (n)", "ssh_rsa_n", n));
+                key_children.push(mpint_node("Public Exponent (e)", "ssh_rsa_e", e));
+                key_children.push(mpint_node("Private Exponent (d)", "ssh_rsa_d", d));
+                key_children.push(mpint_node("CRT Coefficient (iqmp)", "ssh_rsa_iqmp", iqmp));
+                key_children.push(mpint_node("Prime p", "ssh_rsa_p", p));
+                key_children.push(mpint_node("Prime q", "ssh_rsa_q", q));
+            }
+            binary::KeyFields::Ecdsa {
+                curve,
+                pubkey,
+                privkey,
+            } => {
+                key_children.push(make_string_node("Curve", "ssh_ecdsa_curve", curve, base));
+                key_children.push(AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!("Public Key ({} bytes)", pubkey.value.len()),
+                    kind: "ssh_ecdsa_pubkey".into(),
+                    range: pubkey.full_span.to_range(base),
+                    children: Vec::new(),
+                    fields: vec![FieldView {
+                        name: "Size".into(),
+                        value: format!("{} bytes", pubkey.value.len()),
+                        range: Some(pubkey.value_span.to_range(base)),
+                    }],
+                    diagnostics: Vec::new(),
+                });
+                key_children.push(AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!("Private Scalar ({} bytes)", privkey.value.len()),
+                    kind: "ssh_ecdsa_privkey".into(),
+                    range: privkey.full_span.to_range(base),
+                    children: Vec::new(),
+                    fields: vec![FieldView {
+                        name: "Size".into(),
+                        value: format!("{} bytes", privkey.value.len()),
+                        range: Some(privkey.value_span.to_range(base)),
+                    }],
+                    diagnostics: Vec::new(),
+                });
+            }
             binary::KeyFields::Opaque {
                 data_span,
                 algorithm,

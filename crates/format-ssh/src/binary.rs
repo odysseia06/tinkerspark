@@ -111,17 +111,26 @@ pub struct PrivateKeyEntry {
 pub enum KeyFields {
     /// Ed25519: public key (32 bytes) + combined seed||pubkey (64 bytes).
     Ed25519 {
-        /// The 32-byte public key embedded in the private record.
         pubkey: StringField,
-        /// The 64-byte combined field (first 32 = seed, last 32 = pubkey copy).
         combined: StringField,
     },
-    /// Algorithm not yet decoded — coarse span covering all key data.
-    Opaque {
-        /// Span covering the undecoded algorithm-specific fields.
-        data_span: Span,
-        algorithm: String,
+    /// RSA: n, e, d, iqmp, p, q (all mpints encoded as length-prefixed strings).
+    Rsa {
+        n: StringField,
+        e: StringField,
+        d: StringField,
+        iqmp: StringField,
+        p: StringField,
+        q: StringField,
     },
+    /// ECDSA: curve name, public key, private scalar.
+    Ecdsa {
+        curve: StringField,
+        pubkey: StringField,
+        privkey: StringField,
+    },
+    /// Algorithm not yet decoded — coarse span covering all key data.
+    Opaque { data_span: Span, algorithm: String },
 }
 
 /// Cursor for reading through a byte slice with position tracking.
@@ -319,6 +328,10 @@ pub fn parse_private_section(
         // fixed fields for that algorithm and then the comment string.
         let (key_fields, comment) = match algo.as_str() {
             "ssh-ed25519" => parse_ed25519_fields(&mut cur, section_offset)?,
+            "ssh-rsa" => parse_rsa_fields(&mut cur, section_offset)?,
+            "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
+                parse_ecdsa_fields(&mut cur, section_offset)?
+            }
             _ => {
                 // Unknown algorithm — fall back to heuristic scanning, but
                 // only for the last key (where padding follows).
@@ -402,6 +415,48 @@ fn parse_ed25519_fields(
     let key_fields = KeyFields::Ed25519 {
         pubkey: adjust_string_field(pubkey, section_offset),
         combined: adjust_string_field(combined, section_offset),
+    };
+    Ok((key_fields, adjust_string_field(comment, section_offset)))
+}
+
+/// Parse RSA private key fields: n, e, d, iqmp, p, q, comment.
+fn parse_rsa_fields(
+    cur: &mut Cursor<'_>,
+    section_offset: usize,
+) -> Result<(KeyFields, StringField), ParseError> {
+    let n = cur.read_string()?;
+    let e = cur.read_string()?;
+    let d = cur.read_string()?;
+    let iqmp = cur.read_string()?;
+    let p = cur.read_string()?;
+    let q = cur.read_string()?;
+    let comment = cur.read_string()?;
+
+    let key_fields = KeyFields::Rsa {
+        n: adjust_string_field(n, section_offset),
+        e: adjust_string_field(e, section_offset),
+        d: adjust_string_field(d, section_offset),
+        iqmp: adjust_string_field(iqmp, section_offset),
+        p: adjust_string_field(p, section_offset),
+        q: adjust_string_field(q, section_offset),
+    };
+    Ok((key_fields, adjust_string_field(comment, section_offset)))
+}
+
+/// Parse ECDSA private key fields: curve, pubkey, privkey, comment.
+fn parse_ecdsa_fields(
+    cur: &mut Cursor<'_>,
+    section_offset: usize,
+) -> Result<(KeyFields, StringField), ParseError> {
+    let curve = cur.read_string()?;
+    let pubkey = cur.read_string()?;
+    let privkey = cur.read_string()?;
+    let comment = cur.read_string()?;
+
+    let key_fields = KeyFields::Ecdsa {
+        curve: adjust_string_field(curve, section_offset),
+        pubkey: adjust_string_field(pubkey, section_offset),
+        privkey: adjust_string_field(privkey, section_offset),
     };
     Ok((key_fields, adjust_string_field(comment, section_offset)))
 }
@@ -658,8 +713,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_key_opaque_second_key_limited() {
-        // Ed25519 + unknown algo — second key can't be delimited, so it breaks early.
+    fn multi_key_opaque_second_key_heuristic() {
+        // Ed25519 + unknown algo (last key) — heuristic fallback is safe for final key.
         let private_section = {
             let mut sec = Vec::new();
             sec.extend(99u32.to_be_bytes());
@@ -670,7 +725,7 @@ mod tests {
             sec.extend(build_string(&[0xBB; 64]));
             sec.extend(build_string(b"first key"));
             // Key 1: unknown algo
-            sec.extend(build_string(b"ssh-rsa"));
+            sec.extend(build_string(b"ssh-dss"));
             sec.extend(build_string(b"opaque-data"));
             sec.extend(build_string(b"second key"));
             sec.extend([1, 2, 3]);
@@ -697,7 +752,7 @@ mod tests {
         assert_eq!(priv_sec.keys.len(), 2);
         assert_eq!(priv_sec.keys[0].keytype.as_str(), Some("ssh-ed25519"));
         assert_eq!(priv_sec.keys[0].comment.as_str(), Some("first key"));
-        assert_eq!(priv_sec.keys[1].keytype.as_str(), Some("ssh-rsa"));
+        assert_eq!(priv_sec.keys[1].keytype.as_str(), Some("ssh-dss"));
         assert_eq!(priv_sec.keys[1].comment.as_str(), Some("second key"));
         // Not limited because the opaque key is the last one (heuristic is safe).
         assert!(!priv_sec.multi_key_limited);
@@ -707,7 +762,7 @@ mod tests {
 
     #[test]
     fn multi_key_opaque_middle_key_stops_early() {
-        // Ed25519 + rsa (opaque, non-final) + ed25519 — rsa can't be delimited mid-stream.
+        // Ed25519 + dss (opaque, non-final) + ed25519 — dss can't be delimited mid-stream.
         let private_section = {
             let mut sec = Vec::new();
             sec.extend(99u32.to_be_bytes());
@@ -718,7 +773,7 @@ mod tests {
             sec.extend(build_string(&[0xBB; 64]));
             sec.extend(build_string(b"first"));
             // Key 1: unknown algo (non-final)
-            sec.extend(build_string(b"ssh-rsa"));
+            sec.extend(build_string(b"ssh-dss"));
             sec.extend(build_string(b"data"));
             sec.extend(build_string(b"second"));
             // Key 2: Ed25519 (never reached)
@@ -747,10 +802,10 @@ mod tests {
         )
         .unwrap();
 
-        // Ed25519 key 0 is parsed, then rsa key 1 breaks early (opaque, non-final).
+        // Ed25519 key 0 is parsed, then dss key 1 breaks early (opaque, non-final).
         assert_eq!(priv_sec.keys.len(), 2);
         assert_eq!(priv_sec.keys[0].comment.as_str(), Some("first"));
-        assert_eq!(priv_sec.keys[1].keytype.as_str(), Some("ssh-rsa"));
+        assert_eq!(priv_sec.keys[1].keytype.as_str(), Some("ssh-dss"));
         assert!(
             priv_sec.multi_key_limited,
             "should flag limitation: opaque non-final key stopped parsing"

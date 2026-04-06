@@ -169,6 +169,52 @@ fn parses_der_certificate_with_precise_spans() {
         .unwrap();
     assert!(pubkey.range.length() < cert.range.length());
 
+    // SPKI should have child nodes for AlgorithmIdentifier and key bits.
+    let spki_child_kinds: Vec<&str> = pubkey.children.iter().map(|c| c.kind.as_str()).collect();
+    assert!(
+        spki_child_kinds.contains(&"x509_spki_algorithm"),
+        "SPKI should have algorithm child node"
+    );
+    assert!(
+        spki_child_kinds.contains(&"x509_spki_key_bits"),
+        "SPKI should have key bits child node"
+    );
+
+    // SPKI children should have ranges narrower than the SPKI parent.
+    for child in &pubkey.children {
+        assert!(
+            child.range.length() < pubkey.range.length(),
+            "SPKI child '{}' should have range narrower than SPKI parent",
+            child.label
+        );
+        assert!(
+            child.range.offset() >= pubkey.range.offset(),
+            "SPKI child '{}' should start within SPKI",
+            child.label
+        );
+        assert!(
+            child.range.end() <= pubkey.range.end(),
+            "SPKI child '{}' should end within SPKI",
+            child.label
+        );
+    }
+
+    // Algorithm and Key Size fields should now have precise DER ranges.
+    let algo_field = pubkey
+        .fields
+        .iter()
+        .find(|f| f.name == "Algorithm")
+        .unwrap();
+    assert!(
+        algo_field.range.is_some(),
+        "Algorithm field should have a DER span"
+    );
+    let size_field = pubkey.fields.iter().find(|f| f.name == "Key Size").unwrap();
+    assert!(
+        size_field.range.is_some(),
+        "Key Size field should have a DER span"
+    );
+
     let sig = cert
         .children
         .iter()

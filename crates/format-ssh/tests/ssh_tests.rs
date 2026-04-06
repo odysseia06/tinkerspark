@@ -214,6 +214,144 @@ fn garbage_data_fails_gracefully() {
     assert!(result.is_err(), "garbage key should fail gracefully");
 }
 
+// ── RSA private key ──
+
+#[test]
+fn parses_rsa_private_key_fields() {
+    let data = std::fs::read("../../testdata/ssh/id_rsa_unencrypted").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::SshPrivateKey, data.len() as u64);
+
+    let analyzer = tinkerspark_format_ssh::SshAnalyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+    let root = &report.root_nodes[0];
+    assert_eq!(root.kind, "ssh_private_key");
+
+    let priv_section = root
+        .children
+        .iter()
+        .find(|c| c.kind == "ssh_private_unencrypted")
+        .unwrap();
+
+    let key_entry = priv_section
+        .children
+        .iter()
+        .find(|c| c.kind == "ssh_private_key_entry")
+        .unwrap();
+
+    assert!(key_entry
+        .fields
+        .iter()
+        .any(|f| f.name == "Algorithm" && f.value == "ssh-rsa"));
+    assert!(key_entry
+        .fields
+        .iter()
+        .any(|f| f.name == "Comment" && f.value == "rsa@tinkerspark"));
+
+    // RSA key entry should have algorithm-specific child nodes.
+    let entry_kinds: Vec<&str> = key_entry.children.iter().map(|c| c.kind.as_str()).collect();
+    assert!(
+        entry_kinds.contains(&"ssh_rsa_n"),
+        "should have modulus node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_rsa_e"),
+        "should have public exponent node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_rsa_d"),
+        "should have private exponent node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_rsa_iqmp"),
+        "should have CRT coefficient node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_rsa_p"),
+        "should have prime p node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_rsa_q"),
+        "should have prime q node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_comment"),
+        "should have comment node"
+    );
+
+    // All RSA field nodes should have non-empty ranges.
+    for child in &key_entry.children {
+        assert!(
+            !child.range.is_empty(),
+            "RSA child '{}' should have non-empty range",
+            child.label
+        );
+    }
+}
+
+// ── ECDSA private key ──
+
+#[test]
+fn parses_ecdsa_private_key_fields() {
+    let data = std::fs::read("../../testdata/ssh/id_ecdsa_unencrypted").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::SshPrivateKey, data.len() as u64);
+
+    let analyzer = tinkerspark_format_ssh::SshAnalyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+    let root = &report.root_nodes[0];
+    assert_eq!(root.kind, "ssh_private_key");
+
+    let priv_section = root
+        .children
+        .iter()
+        .find(|c| c.kind == "ssh_private_unencrypted")
+        .unwrap();
+
+    let key_entry = priv_section
+        .children
+        .iter()
+        .find(|c| c.kind == "ssh_private_key_entry")
+        .unwrap();
+
+    assert!(key_entry
+        .fields
+        .iter()
+        .any(|f| f.name == "Algorithm" && f.value.starts_with("ecdsa-sha2-")));
+    assert!(key_entry
+        .fields
+        .iter()
+        .any(|f| f.name == "Comment" && f.value == "ecdsa@tinkerspark"));
+
+    // ECDSA key entry should have algorithm-specific child nodes.
+    let entry_kinds: Vec<&str> = key_entry.children.iter().map(|c| c.kind.as_str()).collect();
+    assert!(
+        entry_kinds.contains(&"ssh_ecdsa_curve"),
+        "should have curve node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_ecdsa_pubkey"),
+        "should have ECDSA public key node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_ecdsa_privkey"),
+        "should have ECDSA private scalar node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_comment"),
+        "should have comment node"
+    );
+
+    // All ECDSA field nodes should have non-empty ranges.
+    for child in &key_entry.children {
+        assert!(
+            !child.range.is_empty(),
+            "ECDSA child '{}' should have non-empty range",
+            child.label
+        );
+    }
+}
+
 // ── Public key fixture ──
 
 #[test]

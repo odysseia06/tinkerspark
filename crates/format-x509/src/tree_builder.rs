@@ -137,22 +137,55 @@ pub fn build_cert_tree(
         .as_ref()
         .and_then(|s| s.subject_pki)
         .unwrap_or(cert_range);
+    let spki_sub = tbs_spans
+        .as_ref()
+        .and_then(|s| s.subject_pki)
+        .and_then(|sr| der_spans::extract_spki_spans(cert_der, sr, base));
+    let mut spki_children = Vec::new();
+    if let Some(ref ss) = spki_sub {
+        spki_children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("Algorithm: {}", pk_algo),
+            kind: "x509_spki_algorithm".into(),
+            range: ss.algorithm,
+            children: Vec::new(),
+            fields: vec![FieldView {
+                name: "Algorithm".into(),
+                value: pk_algo.clone(),
+                range: Some(ss.algorithm),
+            }],
+            diagnostics: Vec::new(),
+        });
+        spki_children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("Public Key Bits ({} bits)", pk_bits),
+            kind: "x509_spki_key_bits".into(),
+            range: ss.subject_public_key,
+            children: Vec::new(),
+            fields: vec![FieldView {
+                name: "Size".into(),
+                value: format!("{} bits", pk_bits),
+                range: Some(ss.subject_public_key),
+            }],
+            diagnostics: Vec::new(),
+        });
+    }
     children.push(AnalysisNode {
         id: NodeId::new(),
         label: "Subject Public Key".into(),
         kind: "x509_public_key".into(),
         range: spki_range,
-        children: Vec::new(),
+        children: spki_children,
         fields: vec![
             FieldView {
                 name: "Algorithm".into(),
                 value: pk_algo.clone(),
-                range: None,
+                range: spki_sub.as_ref().map(|s| s.algorithm),
             },
             FieldView {
                 name: "Key Size".into(),
                 value: format!("{} bits", pk_bits),
-                range: None,
+                range: spki_sub.as_ref().map(|s| s.subject_public_key),
             },
         ],
         diagnostics: Vec::new(),
