@@ -128,6 +128,40 @@ fn parses_der_certificate_with_precise_spans() {
         .unwrap();
     assert!(validity.range.length() < cert.range.length());
 
+    // Validity should have notBefore and notAfter with precise DER ranges.
+    let not_before_field = validity
+        .fields
+        .iter()
+        .find(|f| f.name == "Not Before")
+        .unwrap();
+    assert!(
+        not_before_field.range.is_some(),
+        "Not Before should have a DER span"
+    );
+
+    let not_after_field = validity
+        .fields
+        .iter()
+        .find(|f| f.name == "Not After")
+        .unwrap();
+    assert!(
+        not_after_field.range.is_some(),
+        "Not After should have a DER span"
+    );
+
+    // notBefore and notAfter should be inside the Validity range.
+    let nb = not_before_field.range.unwrap();
+    let na = not_after_field.range.unwrap();
+    assert!(
+        nb.offset() >= validity.range.offset(),
+        "notBefore should be within Validity"
+    );
+    assert!(
+        na.end() <= validity.range.end(),
+        "notAfter should be within Validity"
+    );
+    assert!(nb.end() <= na.offset(), "notBefore should precede notAfter");
+
     let pubkey = cert
         .children
         .iter()
@@ -145,6 +179,21 @@ fn parses_der_certificate_with_precise_spans() {
     // Extensions node range should also be precise (for v3 certs).
     if let Some(exts) = cert.children.iter().find(|c| c.kind == "x509_extensions") {
         assert!(exts.range.length() < cert.range.length());
+
+        // Each individual extension should have a wrapper span that is
+        // within the extensions range and smaller than the full cert.
+        for ext_child in &exts.children {
+            assert!(
+                ext_child.range.length() < cert.range.length(),
+                "extension '{}' should have a precise range",
+                ext_child.label
+            );
+            assert!(
+                ext_child.range.offset() >= exts.range.offset(),
+                "extension '{}' should be within extensions range",
+                ext_child.label
+            );
+        }
     }
 
     // No PEM diagnostic for DER input.

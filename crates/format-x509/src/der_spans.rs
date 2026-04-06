@@ -45,6 +45,22 @@ pub struct TbsSpans {
     pub extensions: Option<ByteRange>,
 }
 
+/// Spans for the Validity SEQUENCE internals.
+#[derive(Debug)]
+pub struct ValiditySpans {
+    /// notBefore time element.
+    pub not_before: Option<ByteRange>,
+    /// notAfter time element.
+    pub not_after: Option<ByteRange>,
+}
+
+/// Span for a single extension wrapper (OID + critical + extnValue).
+#[derive(Debug)]
+pub struct ExtensionSpan {
+    /// The full SEQUENCE wrapping this extension.
+    pub wrapper: ByteRange,
+}
+
 /// Parse a DER length, returning (content_length, header_bytes_consumed).
 fn parse_length(data: &[u8]) -> Option<(usize, usize)> {
     if data.is_empty() {
@@ -205,6 +221,93 @@ pub fn extract_tbs_spans(der: &[u8], tbs_range: ByteRange, base_offset: u64) -> 
     }
 
     spans
+}
+
+/// Walk inside a Validity SEQUENCE to extract notBefore and notAfter spans.
+pub fn extract_validity_spans(
+    der: &[u8],
+    validity_range: ByteRange,
+    base_offset: u64,
+) -> ValiditySpans {
+    let mut spans = ValiditySpans {
+        not_before: None,
+        not_after: None,
+    };
+
+    let start = (validity_range.offset() - base_offset) as usize;
+    let (tag, content_off, content_len, _) = match read_tlv(der, start) {
+        Some(t) => t,
+        None => return spans,
+    };
+    if tag != 0x30 {
+        return spans;
+    }
+
+    let mut pos = content_off;
+    let end = content_off + content_len;
+
+    // notBefore (UTCTime or GeneralizedTime)
+    if pos < end {
+        if let Some((_, _, _, total)) = read_tlv(der, pos) {
+            spans.not_before = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+            pos += total;
+        }
+    }
+
+    // notAfter (UTCTime or GeneralizedTime)
+    if pos < end {
+        if let Some((_, _, _, total)) = read_tlv(der, pos) {
+            spans.not_after = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+        }
+    }
+
+    spans
+}
+
+/// Walk inside the extensions [3] EXPLICIT wrapper to extract individual
+/// extension SEQUENCE spans.
+///
+/// The structure is: [3] EXPLICIT { SEQUENCE { ext1, ext2, ... } }
+/// Each ext is: SEQUENCE { OID, [BOOLEAN critical], OCTET STRING value }
+pub fn extract_extension_spans(
+    der: &[u8],
+    extensions_range: ByteRange,
+    base_offset: u64,
+) -> Vec<ExtensionSpan> {
+    let mut result = Vec::new();
+
+    let start = (extensions_range.offset() - base_offset) as usize;
+    // Read the [3] EXPLICIT wrapper.
+    let (_, explicit_content_off, explicit_content_len, _) = match read_tlv(der, start) {
+        Some(t) => t,
+        None => return result,
+    };
+
+    // Inside the EXPLICIT wrapper is a SEQUENCE of extensions.
+    let (tag, seq_content_off, seq_content_len, _) = match read_tlv(der, explicit_content_off) {
+        Some(t) => t,
+        None => return result,
+    };
+    if tag != 0x30 {
+        return result;
+    }
+
+    // Clamp to the actual EXPLICIT content.
+    let end = (seq_content_off + seq_content_len).min(explicit_content_off + explicit_content_len);
+    let mut pos = seq_content_off;
+
+    while pos < end {
+        let (_, _, _, total) = match read_tlv(der, pos) {
+            Some(t) => t,
+            None => break,
+        };
+        result.push(ExtensionSpan {
+            wrapper: ByteRange::new(base_offset + pos as u64, total as u64),
+        });
+        pos += total;
+    }
+
+    result
 }
 
 #[cfg(test)]

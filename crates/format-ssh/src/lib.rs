@@ -498,20 +498,81 @@ fn parse_unencrypted_private_section(
             base,
         ));
 
-        if key.key_data_span.length > 0 {
-            key_children.push(AnalysisNode {
-                id: NodeId::new(),
-                label: format!("Key Data ({} bytes)", key.key_data_span.length),
-                kind: "ssh_key_data".into(),
-                range: key.key_data_span.to_range(base),
-                children: Vec::new(),
-                fields: vec![FieldView {
-                    name: "Size".into(),
-                    value: format!("{} bytes", key.key_data_span.length),
-                    range: Some(key.key_data_span.to_range(base)),
-                }],
-                diagnostics: Vec::new(),
-            });
+        match &key.key_fields {
+            binary::KeyFields::Ed25519 { pubkey, combined } => {
+                key_children.push(AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!("Public Key ({} bytes)", pubkey.value.len()),
+                    kind: "ssh_ed25519_pubkey".into(),
+                    range: pubkey.full_span.to_range(base),
+                    children: Vec::new(),
+                    fields: vec![FieldView {
+                        name: "Size".into(),
+                        value: format!("{} bytes", pubkey.value.len()),
+                        range: Some(pubkey.value_span.to_range(base)),
+                    }],
+                    diagnostics: Vec::new(),
+                });
+                // The combined field is seed(32) || pubkey(32).
+                // We expose it as one node but label the structure.
+                let seed_len = combined.value.len().saturating_sub(pubkey.value.len());
+                key_children.push(AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!(
+                        "Private Material ({} bytes: {} seed + {} pubkey)",
+                        combined.value.len(),
+                        seed_len,
+                        pubkey.value.len()
+                    ),
+                    kind: "ssh_ed25519_private".into(),
+                    range: combined.full_span.to_range(base),
+                    children: Vec::new(),
+                    fields: vec![
+                        FieldView {
+                            name: "Size".into(),
+                            value: format!("{} bytes", combined.value.len()),
+                            range: Some(combined.value_span.to_range(base)),
+                        },
+                        FieldView {
+                            name: "Structure".into(),
+                            value: format!(
+                                "{}-byte seed || {}-byte public key copy",
+                                seed_len,
+                                pubkey.value.len()
+                            ),
+                            range: None,
+                        },
+                    ],
+                    diagnostics: Vec::new(),
+                });
+            }
+            binary::KeyFields::Opaque {
+                data_span,
+                algorithm,
+            } => {
+                if data_span.length > 0 {
+                    key_children.push(AnalysisNode {
+                        id: NodeId::new(),
+                        label: format!("Key Data ({} bytes)", data_span.length),
+                        kind: "ssh_key_data".into(),
+                        range: data_span.to_range(base),
+                        children: Vec::new(),
+                        fields: vec![FieldView {
+                            name: "Size".into(),
+                            value: format!("{} bytes", data_span.length),
+                            range: Some(data_span.to_range(base)),
+                        }],
+                        diagnostics: vec![Diagnostic {
+                            severity: Severity::Info,
+                            message: format!(
+                                "Algorithm-specific field decoding not yet supported for {}",
+                                algorithm
+                            ),
+                            range: None,
+                        }],
+                    });
+                }
+            }
         }
 
         key_children.push(make_string_node(

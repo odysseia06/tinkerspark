@@ -83,6 +83,10 @@ pub fn build_cert_tree(
         .as_ref()
         .and_then(|s| s.validity)
         .unwrap_or(cert_range);
+    let validity_sub = tbs_spans
+        .as_ref()
+        .and_then(|s| s.validity)
+        .map(|vr| der_spans::extract_validity_spans(cert_der, vr, base));
     children.push(AnalysisNode {
         id: NodeId::new(),
         label: "Validity Period".into(),
@@ -93,12 +97,12 @@ pub fn build_cert_tree(
             FieldView {
                 name: "Not Before".into(),
                 value: not_before,
-                range: None,
+                range: validity_sub.as_ref().and_then(|v| v.not_before),
             },
             FieldView {
                 name: "Not After".into(),
                 value: not_after,
-                range: None,
+                range: validity_sub.as_ref().and_then(|v| v.not_after),
             },
         ],
         diagnostics: Vec::new(),
@@ -162,10 +166,25 @@ pub fn build_cert_tree(
     // ── Extensions ──
     let extensions = tbs.extensions();
     if !extensions.is_empty() {
+        // Get precise DER wrapper spans for each extension SEQUENCE.
+        let ext_wrapper_spans = tbs_spans
+            .as_ref()
+            .and_then(|s| s.extensions)
+            .map(|er| der_spans::extract_extension_spans(cert_der, er, base))
+            .unwrap_or_default();
+
         let mut ext_children = Vec::new();
-        for ext in extensions {
+        for (idx, ext) in extensions.iter().enumerate() {
             let oid_str = oid_name(&ext.oid.to_id_string());
             let critical_str = if ext.critical { " (critical)" } else { "" };
+
+            // Use the wrapper span if available, otherwise fall back to value bytes.
+            let ext_range = ext_wrapper_spans
+                .get(idx)
+                .map(|es| es.wrapper)
+                .or_else(|| compute_field_range(cert_der, ext.value, base))
+                .unwrap_or(cert_range);
+
             let mut ext_fields = vec![
                 FieldView {
                     name: "OID".into(),
@@ -192,7 +211,6 @@ pub fn build_cert_tree(
                 });
             }
 
-            let ext_range = compute_field_range(cert_der, ext.value, base).unwrap_or(cert_range);
             ext_children.push(AnalysisNode {
                 id: NodeId::new(),
                 label: format!("{}{}", oid_str, critical_str),

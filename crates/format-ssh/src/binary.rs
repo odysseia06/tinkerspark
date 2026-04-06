@@ -95,9 +95,27 @@ pub struct PrivateKeyEntry {
     /// Span covering the entire key entry (keytype through comment).
     pub full_span: Span,
     pub keytype: StringField,
-    /// Span covering the algorithm-specific data between keytype and comment.
-    pub key_data_span: Span,
+    /// Algorithm-specific decoded fields, or a coarse fallback span.
+    pub key_fields: KeyFields,
     pub comment: StringField,
+}
+
+/// Algorithm-specific private key fields.
+#[derive(Debug)]
+pub enum KeyFields {
+    /// Ed25519: public key (32 bytes) + combined seed||pubkey (64 bytes).
+    Ed25519 {
+        /// The 32-byte public key embedded in the private record.
+        pubkey: StringField,
+        /// The 64-byte combined field (first 32 = seed, last 32 = pubkey copy).
+        combined: StringField,
+    },
+    /// Algorithm not yet decoded — coarse span covering all key data.
+    Opaque {
+        /// Span covering the undecoded algorithm-specific fields.
+        data_span: Span,
+        algorithm: String,
+    },
 }
 
 /// Cursor for reading through a byte slice with position tracking.
@@ -280,100 +298,49 @@ pub fn parse_private_section(
         length: ci2_span.length,
     };
 
-    // The comment/padding heuristic only works reliably for a single key.
-    // With multiple keys the bytes after key 0 are key 1, not padding, so the
-    // probe would consume subsequent keys. Until algorithm-aware per-key
-    // parsing is implemented, we only parse the first key.
-    let parse_count = 1;
     let multi_key = nkeys > 1;
 
-    let mut keys = Vec::with_capacity(parse_count);
-    for _ in 0..parse_count {
+    let mut keys = Vec::with_capacity(nkeys as usize);
+    for i in 0..nkeys {
         let entry_start = cur.pos;
 
         let keytype = cur.read_string()?;
+        let algo = std::str::from_utf8(&keytype.value)
+            .unwrap_or("")
+            .to_string();
 
-        // Heuristic: read length-prefixed strings until the remainder looks
-        // like OpenSSH padding (1, 2, 3, ...).  The last string consumed is
-        // the comment; everything between keytype and comment is key data.
-        // This is only safe for the final (or only) key in the section.
-
-        let key_data_start = cur.pos;
-        let mut last_string_before_comment = None;
-        let mut probe_pos = cur.pos;
-
-        loop {
-            let save = cur.pos;
-            match cur.read_string() {
-                Ok(s) => {
-                    last_string_before_comment = Some((save, s));
-                    probe_pos = cur.pos;
-                }
-                Err(_) => {
-                    cur.pos = save;
+        // Dispatch to algorithm-specific parsing. Each arm reads the
+        // fixed fields for that algorithm and then the comment string.
+        let (key_fields, comment) = match algo.as_str() {
+            "ssh-ed25519" => parse_ed25519_fields(&mut cur, section_offset)?,
+            _ => {
+                // Unknown algorithm — fall back to heuristic scanning, but
+                // only for the last key (where padding follows).
+                if i < nkeys - 1 {
+                    // Cannot safely delimit this key entry. Stop parsing.
+                    let keytype = adjust_string_field(keytype, section_offset);
+                    keys.push(PrivateKeyEntry {
+                        full_span: Span {
+                            offset: section_offset + entry_start,
+                            length: cur.pos - entry_start,
+                        },
+                        keytype,
+                        key_fields: KeyFields::Opaque {
+                            data_span: Span {
+                                offset: section_offset + cur.pos,
+                                length: 0,
+                            },
+                            algorithm: algo.clone(),
+                        },
+                        comment: empty_string_field(section_offset + cur.pos),
+                    });
                     break;
                 }
-            }
-            if looks_like_padding(&data[cur.pos..]) {
-                break;
-            }
-            if cur.remaining() < 4 {
-                break;
-            }
-        }
-
-        let (comment_field_start, comment) = match last_string_before_comment {
-            Some((off, s)) => (off, s),
-            None => {
-                let empty = StringField {
-                    full_span: Span {
-                        offset: section_offset + cur.pos,
-                        length: 0,
-                    },
-                    value_span: Span {
-                        offset: section_offset + cur.pos,
-                        length: 0,
-                    },
-                    value: Vec::new(),
-                };
-                (cur.pos, empty)
+                parse_opaque_fields(&mut cur, data, section_offset, &algo)?
             }
         };
 
-        cur.pos = probe_pos;
-
-        let key_data_end = comment_field_start;
-        let key_data_span = Span {
-            offset: section_offset + key_data_start,
-            length: key_data_end - key_data_start,
-        };
-
-        // Adjust comment spans to outer container coordinates.
-        let comment = StringField {
-            full_span: Span {
-                offset: section_offset + comment.full_span.offset,
-                length: comment.full_span.length,
-            },
-            value_span: Span {
-                offset: section_offset + comment.value_span.offset,
-                length: comment.value_span.length,
-            },
-            value: comment.value,
-        };
-
-        // Adjust keytype spans.
-        let keytype = StringField {
-            full_span: Span {
-                offset: section_offset + keytype.full_span.offset,
-                length: keytype.full_span.length,
-            },
-            value_span: Span {
-                offset: section_offset + keytype.value_span.offset,
-                length: keytype.value_span.length,
-            },
-            value: keytype.value,
-        };
-
+        let keytype = adjust_string_field(keytype, section_offset);
         let entry_end = cur.pos;
         keys.push(PrivateKeyEntry {
             full_span: Span {
@@ -381,7 +348,7 @@ pub fn parse_private_section(
                 length: entry_end - entry_start,
             },
             keytype,
-            key_data_span,
+            key_fields,
             comment,
         });
     }
@@ -396,6 +363,8 @@ pub fn parse_private_section(
         None
     };
 
+    let actually_limited = multi_key && (keys.len() as u32) < nkeys;
+
     Ok(ParsedPrivateSection {
         checkint1,
         checkint1_span: ci1_span,
@@ -404,8 +373,105 @@ pub fn parse_private_section(
         keys,
         padding_span,
         checkints_match: checkint1 == checkint2,
-        multi_key_limited: multi_key,
+        multi_key_limited: actually_limited,
     })
+}
+
+/// Parse Ed25519 private key fields: string pubkey(32), string combined(64), string comment.
+fn parse_ed25519_fields(
+    cur: &mut Cursor<'_>,
+    section_offset: usize,
+) -> Result<(KeyFields, StringField), ParseError> {
+    let pubkey = cur.read_string()?;
+    let combined = cur.read_string()?;
+    let comment = cur.read_string()?;
+
+    let key_fields = KeyFields::Ed25519 {
+        pubkey: adjust_string_field(pubkey, section_offset),
+        combined: adjust_string_field(combined, section_offset),
+    };
+    Ok((key_fields, adjust_string_field(comment, section_offset)))
+}
+
+/// Fallback: scan forward using the padding heuristic (only safe for the last key).
+fn parse_opaque_fields(
+    cur: &mut Cursor<'_>,
+    data: &[u8],
+    section_offset: usize,
+    algo: &str,
+) -> Result<(KeyFields, StringField), ParseError> {
+    let key_data_start = cur.pos;
+    let mut last_string: Option<(usize, StringField)> = None;
+    let mut probe_pos = cur.pos;
+
+    loop {
+        let save = cur.pos;
+        match cur.read_string() {
+            Ok(s) => {
+                last_string = Some((save, s));
+                probe_pos = cur.pos;
+            }
+            Err(_) => {
+                cur.pos = save;
+                break;
+            }
+        }
+        if looks_like_padding(&data[cur.pos..]) {
+            break;
+        }
+        if cur.remaining() < 4 {
+            break;
+        }
+    }
+
+    let (comment_start, comment) = match last_string {
+        Some((off, s)) => (off, s),
+        None => (cur.pos, empty_string_field_local(cur.pos)),
+    };
+    cur.pos = probe_pos;
+
+    let data_span = Span {
+        offset: section_offset + key_data_start,
+        length: comment_start - key_data_start,
+    };
+    let key_fields = KeyFields::Opaque {
+        data_span,
+        algorithm: algo.to_string(),
+    };
+    Ok((key_fields, adjust_string_field(comment, section_offset)))
+}
+
+/// Adjust a StringField's spans from section-local to container-global coordinates.
+fn adjust_string_field(f: StringField, section_offset: usize) -> StringField {
+    StringField {
+        full_span: Span {
+            offset: section_offset + f.full_span.offset,
+            length: f.full_span.length,
+        },
+        value_span: Span {
+            offset: section_offset + f.value_span.offset,
+            length: f.value_span.length,
+        },
+        value: f.value,
+    }
+}
+
+/// Create an empty StringField at the given offset (container-global).
+fn empty_string_field(offset: usize) -> StringField {
+    StringField {
+        full_span: Span { offset, length: 0 },
+        value_span: Span { offset, length: 0 },
+        value: Vec::new(),
+    }
+}
+
+/// Create an empty StringField at a section-local offset (not yet adjusted).
+fn empty_string_field_local(offset: usize) -> StringField {
+    StringField {
+        full_span: Span { offset, length: 0 },
+        value_span: Span { offset, length: 0 },
+        value: Vec::new(),
+    }
 }
 
 /// Check if the remaining bytes look like OpenSSH padding (1, 2, 3, ...).
@@ -447,12 +513,16 @@ mod tests {
 
     #[test]
     fn parses_minimal_unencrypted_container() {
+        // Ed25519 private record: keytype, pubkey(32), combined(64), comment
+        let fake_pubkey = [0xAA; 32];
+        let fake_combined = [0xBB; 64]; // seed(32) || pubkey(32)
         let private_section = {
             let mut sec = Vec::new();
             sec.extend(42u32.to_be_bytes()); // checkint1
             sec.extend(42u32.to_be_bytes()); // checkint2
             sec.extend(build_string(b"ssh-ed25519")); // keytype
-            sec.extend(build_string(b"\x00\x01\x02\x03")); // key data
+            sec.extend(build_string(&fake_pubkey)); // public key (32 bytes)
+            sec.extend(build_string(&fake_combined)); // combined seed||pubkey (64 bytes)
             sec.extend(build_string(b"test comment")); // comment
             sec.extend([1, 2, 3]); // padding
             sec
@@ -479,6 +549,14 @@ mod tests {
         assert_eq!(priv_sec.keys[0].keytype.as_str(), Some("ssh-ed25519"));
         assert_eq!(priv_sec.keys[0].comment.as_str(), Some("test comment"));
         assert!(priv_sec.padding_span.is_some());
+        // Ed25519 fields should be decoded.
+        match &priv_sec.keys[0].key_fields {
+            KeyFields::Ed25519 { pubkey, combined } => {
+                assert_eq!(pubkey.value.len(), 32);
+                assert_eq!(combined.value.len(), 64);
+            }
+            other => panic!("expected Ed25519 fields, got {:?}", other),
+        }
     }
 
     #[test]
@@ -513,19 +591,21 @@ mod tests {
     }
 
     #[test]
-    fn multi_key_container_parses_first_key_only() {
-        // Build a 2-key private section. The heuristic only parses key 0.
+    fn multi_key_ed25519_both_parsed() {
+        // Two Ed25519 keys — both should be parsed since Ed25519 has known field layout.
         let private_section = {
             let mut sec = Vec::new();
             sec.extend(99u32.to_be_bytes()); // checkint1
             sec.extend(99u32.to_be_bytes()); // checkint2
-                                             // Key 0
+                                             // Key 0: Ed25519
             sec.extend(build_string(b"ssh-ed25519"));
-            sec.extend(build_string(b"\x00\x01\x02\x03")); // key data
+            sec.extend(build_string(&[0xAA; 32])); // pubkey
+            sec.extend(build_string(&[0xBB; 64])); // combined
             sec.extend(build_string(b"first key"));
-            // Key 1
-            sec.extend(build_string(b"ssh-rsa"));
-            sec.extend(build_string(b"\x10\x11\x12\x13")); // key data
+            // Key 1: Ed25519
+            sec.extend(build_string(b"ssh-ed25519"));
+            sec.extend(build_string(&[0xCC; 32])); // pubkey
+            sec.extend(build_string(&[0xDD; 64])); // combined
             sec.extend(build_string(b"second key"));
             sec.extend([1, 2, 3]); // padding
             sec
@@ -551,12 +631,113 @@ mod tests {
         )
         .unwrap();
 
-        // Only the first key is parsed.
-        assert_eq!(priv_sec.keys.len(), 1);
+        // Both Ed25519 keys should be parsed (known field layout).
+        assert_eq!(priv_sec.keys.len(), 2);
         assert_eq!(priv_sec.keys[0].keytype.as_str(), Some("ssh-ed25519"));
+        assert_eq!(priv_sec.keys[0].comment.as_str(), Some("first key"));
+        assert_eq!(priv_sec.keys[1].keytype.as_str(), Some("ssh-ed25519"));
+        assert_eq!(priv_sec.keys[1].comment.as_str(), Some("second key"));
+        assert!(
+            !priv_sec.multi_key_limited,
+            "both keys parsed — should not be limited"
+        );
+    }
+
+    #[test]
+    fn multi_key_opaque_second_key_limited() {
+        // Ed25519 + unknown algo — second key can't be delimited, so it breaks early.
+        let private_section = {
+            let mut sec = Vec::new();
+            sec.extend(99u32.to_be_bytes());
+            sec.extend(99u32.to_be_bytes());
+            // Key 0: Ed25519
+            sec.extend(build_string(b"ssh-ed25519"));
+            sec.extend(build_string(&[0xAA; 32]));
+            sec.extend(build_string(&[0xBB; 64]));
+            sec.extend(build_string(b"first key"));
+            // Key 1: unknown algo
+            sec.extend(build_string(b"ssh-rsa"));
+            sec.extend(build_string(b"opaque-data"));
+            sec.extend(build_string(b"second key"));
+            sec.extend([1, 2, 3]);
+            sec
+        };
+        let mut data = AUTH_MAGIC.to_vec();
+        data.extend(build_string(b"none"));
+        data.extend(build_string(b"none"));
+        data.extend(build_string(b""));
+        data.extend(2u32.to_be_bytes());
+        data.extend(build_string(b"pub0"));
+        data.extend(build_string(b"pub1"));
+        data.extend(build_string(&private_section));
+
+        let container = parse_container(&data).unwrap();
+        let priv_sec = parse_private_section(
+            &container.private_section.value,
+            container.nkeys,
+            container.private_section.value_span.offset,
+        )
+        .unwrap();
+
+        // First key parsed via Ed25519, second via opaque heuristic (it's the last key).
+        assert_eq!(priv_sec.keys.len(), 2);
+        assert_eq!(priv_sec.keys[0].keytype.as_str(), Some("ssh-ed25519"));
+        assert_eq!(priv_sec.keys[0].comment.as_str(), Some("first key"));
+        assert_eq!(priv_sec.keys[1].keytype.as_str(), Some("ssh-rsa"));
+        assert_eq!(priv_sec.keys[1].comment.as_str(), Some("second key"));
+        // Not limited because the opaque key is the last one (heuristic is safe).
+        assert!(!priv_sec.multi_key_limited);
+    }
+
+    #[test]
+    fn multi_key_opaque_middle_key_stops_early() {
+        // Ed25519 + rsa (opaque, non-final) + ed25519 — rsa can't be delimited mid-stream.
+        let private_section = {
+            let mut sec = Vec::new();
+            sec.extend(99u32.to_be_bytes());
+            sec.extend(99u32.to_be_bytes());
+            // Key 0: Ed25519
+            sec.extend(build_string(b"ssh-ed25519"));
+            sec.extend(build_string(&[0xAA; 32]));
+            sec.extend(build_string(&[0xBB; 64]));
+            sec.extend(build_string(b"first"));
+            // Key 1: unknown algo (non-final)
+            sec.extend(build_string(b"ssh-rsa"));
+            sec.extend(build_string(b"data"));
+            sec.extend(build_string(b"second"));
+            // Key 2: Ed25519 (never reached)
+            sec.extend(build_string(b"ssh-ed25519"));
+            sec.extend(build_string(&[0xCC; 32]));
+            sec.extend(build_string(&[0xDD; 64]));
+            sec.extend(build_string(b"third"));
+            sec.extend([1, 2, 3]);
+            sec
+        };
+        let mut data = AUTH_MAGIC.to_vec();
+        data.extend(build_string(b"none"));
+        data.extend(build_string(b"none"));
+        data.extend(build_string(b""));
+        data.extend(3u32.to_be_bytes());
+        data.extend(build_string(b"pub0"));
+        data.extend(build_string(b"pub1"));
+        data.extend(build_string(b"pub2"));
+        data.extend(build_string(&private_section));
+
+        let container = parse_container(&data).unwrap();
+        let priv_sec = parse_private_section(
+            &container.private_section.value,
+            container.nkeys,
+            container.private_section.value_span.offset,
+        )
+        .unwrap();
+
+        // Ed25519 key 0 is parsed, then rsa key 1 breaks early (opaque, non-final).
+        assert_eq!(priv_sec.keys.len(), 2);
+        assert_eq!(priv_sec.keys[0].comment.as_str(), Some("first"));
+        assert_eq!(priv_sec.keys[1].keytype.as_str(), Some("ssh-rsa"));
         assert!(
             priv_sec.multi_key_limited,
-            "should flag that multi-key parsing was limited"
+            "should flag limitation: opaque non-final key stopped parsing"
         );
     }
 }

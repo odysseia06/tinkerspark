@@ -93,6 +93,40 @@ fn parses_unencrypted_ed25519_private_key() {
         .iter()
         .any(|f| f.name == "Comment" && f.value == "test@tinkerspark"));
 
+    // Ed25519 key entry should have algorithm-specific child nodes.
+    let entry_kinds: Vec<&str> = key_entry.children.iter().map(|c| c.kind.as_str()).collect();
+    assert!(
+        entry_kinds.contains(&"ssh_ed25519_pubkey"),
+        "should have Ed25519 public key node, got: {:?}",
+        entry_kinds
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_ed25519_private"),
+        "should have Ed25519 private material node"
+    );
+    assert!(
+        entry_kinds.contains(&"ssh_comment"),
+        "should have comment node"
+    );
+
+    // Ed25519 public key should be 32 bytes.
+    let pk_node = key_entry
+        .children
+        .iter()
+        .find(|c| c.kind == "ssh_ed25519_pubkey")
+        .unwrap();
+    assert!(pk_node.label.contains("32 bytes"));
+    assert!(!pk_node.range.is_empty());
+
+    // Ed25519 private material should be 64 bytes.
+    let priv_node = key_entry
+        .children
+        .iter()
+        .find(|c| c.kind == "ssh_ed25519_private")
+        .unwrap();
+    assert!(priv_node.label.contains("64 bytes"));
+    assert!(!priv_node.range.is_empty());
+
     // Root should report unencrypted.
     assert!(root
         .fields
