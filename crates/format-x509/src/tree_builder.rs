@@ -1,3 +1,4 @@
+use crate::der_spans;
 use tinkerspark_core_analyze::{AnalysisNode, FieldView};
 use tinkerspark_core_types::{ByteRange, Diagnostic, NodeId, Severity};
 use x509_parser::certificate::X509Certificate;
@@ -15,6 +16,13 @@ pub fn build_cert_tree(
     is_pem: bool,
 ) -> AnalysisNode {
     let tbs = &cert.tbs_certificate;
+    let base = cert_range.offset();
+
+    // Extract precise DER spans via TLV walking.
+    let cert_spans = der_spans::extract_cert_spans(cert_der, base);
+    let tbs_spans = cert_spans
+        .as_ref()
+        .map(|cs| der_spans::extract_tbs_spans(cert_der, cs.tbs, base));
 
     let mut children = Vec::new();
     let mut cert_fields = Vec::new();
@@ -24,7 +32,7 @@ pub fn build_cert_tree(
     cert_fields.push(FieldView {
         name: "Version".into(),
         value: format!("v{}", tbs.version.0 + 1),
-        range: None,
+        range: tbs_spans.as_ref().and_then(|s| s.version),
     });
 
     // ── Serial Number ──
@@ -34,27 +42,30 @@ pub fn build_cert_tree(
         .map(|b| format!("{:02X}", b))
         .collect::<Vec<_>>()
         .join(":");
-    let serial_range = compute_field_range(cert_der, tbs.raw_serial(), cert_range.offset());
     cert_fields.push(FieldView {
         name: "Serial Number".into(),
         value: serial_hex,
-        range: serial_range,
+        range: tbs_spans.as_ref().and_then(|s| s.serial),
     });
 
     // ── Signature Algorithm (TBS inner) ──
     cert_fields.push(FieldView {
         name: "Signature Algorithm".into(),
         value: oid_name(&tbs.signature.algorithm.to_id_string()),
-        range: None,
+        range: tbs_spans.as_ref().and_then(|s| s.signature),
     });
 
     // ── Issuer ──
     let issuer_str = format_x509_name(&tbs.issuer);
+    let issuer_range = tbs_spans
+        .as_ref()
+        .and_then(|s| s.issuer)
+        .unwrap_or(cert_range);
     children.push(AnalysisNode {
         id: NodeId::new(),
         label: "Issuer".into(),
         kind: "x509_issuer".into(),
-        range: cert_range,
+        range: issuer_range,
         children: Vec::new(),
         fields: name_fields(&tbs.issuer),
         diagnostics: Vec::new(),
@@ -62,17 +73,21 @@ pub fn build_cert_tree(
     cert_fields.push(FieldView {
         name: "Issuer".into(),
         value: issuer_str,
-        range: None,
+        range: tbs_spans.as_ref().and_then(|s| s.issuer),
     });
 
     // ── Validity ──
     let not_before = format!("{}", tbs.validity.not_before);
     let not_after = format!("{}", tbs.validity.not_after);
+    let validity_range = tbs_spans
+        .as_ref()
+        .and_then(|s| s.validity)
+        .unwrap_or(cert_range);
     children.push(AnalysisNode {
         id: NodeId::new(),
         label: "Validity Period".into(),
         kind: "x509_validity".into(),
-        range: cert_range,
+        range: validity_range,
         children: Vec::new(),
         fields: vec![
             FieldView {
@@ -91,11 +106,15 @@ pub fn build_cert_tree(
 
     // ── Subject ──
     let subject_str = format_x509_name(&tbs.subject);
+    let subject_range = tbs_spans
+        .as_ref()
+        .and_then(|s| s.subject)
+        .unwrap_or(cert_range);
     children.push(AnalysisNode {
         id: NodeId::new(),
         label: "Subject".into(),
         kind: "x509_subject".into(),
-        range: cert_range,
+        range: subject_range,
         children: Vec::new(),
         fields: name_fields(&tbs.subject),
         diagnostics: Vec::new(),
@@ -103,20 +122,22 @@ pub fn build_cert_tree(
     cert_fields.push(FieldView {
         name: "Subject".into(),
         value: subject_str,
-        range: None,
+        range: tbs_spans.as_ref().and_then(|s| s.subject),
     });
 
     // ── Subject Public Key Info ──
     let spki = &tbs.subject_pki;
     let pk_algo = oid_name(&spki.algorithm.algorithm.to_id_string());
     let pk_bits = spki.subject_public_key.data.len() * 8;
-    let pk_range =
-        compute_field_range(cert_der, &spki.subject_public_key.data, cert_range.offset());
+    let spki_range = tbs_spans
+        .as_ref()
+        .and_then(|s| s.subject_pki)
+        .unwrap_or(cert_range);
     children.push(AnalysisNode {
         id: NodeId::new(),
         label: "Subject Public Key".into(),
         kind: "x509_public_key".into(),
-        range: pk_range.unwrap_or(cert_range),
+        range: spki_range,
         children: Vec::new(),
         fields: vec![
             FieldView {
@@ -135,7 +156,7 @@ pub fn build_cert_tree(
     cert_fields.push(FieldView {
         name: "Public Key Algorithm".into(),
         value: pk_algo,
-        range: None,
+        range: tbs_spans.as_ref().and_then(|s| s.subject_pki),
     });
 
     // ── Extensions ──
@@ -159,11 +180,10 @@ pub fn build_cert_tree(
                 FieldView {
                     name: "Value Size".into(),
                     value: format!("{} bytes", ext.value.len()),
-                    range: compute_field_range(cert_der, ext.value, cert_range.offset()),
+                    range: compute_field_range(cert_der, ext.value, base),
                 },
             ];
 
-            // Use parsed_extension() for human-readable info.
             if let Some(parsed) = format_parsed_extension(ext) {
                 ext_fields.push(FieldView {
                     name: "Parsed".into(),
@@ -172,8 +192,7 @@ pub fn build_cert_tree(
                 });
             }
 
-            let ext_range =
-                compute_field_range(cert_der, ext.value, cert_range.offset()).unwrap_or(cert_range);
+            let ext_range = compute_field_range(cert_der, ext.value, base).unwrap_or(cert_range);
             ext_children.push(AnalysisNode {
                 id: NodeId::new(),
                 label: format!("{}{}", oid_str, critical_str),
@@ -184,11 +203,15 @@ pub fn build_cert_tree(
                 diagnostics: Vec::new(),
             });
         }
+        let extensions_range = tbs_spans
+            .as_ref()
+            .and_then(|s| s.extensions)
+            .unwrap_or(cert_range);
         children.push(AnalysisNode {
             id: NodeId::new(),
             label: format!("Extensions ({})", extensions.len()),
             kind: "x509_extensions".into(),
-            range: cert_range,
+            range: extensions_range,
             children: ext_children,
             fields: Vec::new(),
             diagnostics: Vec::new(),
@@ -197,24 +220,24 @@ pub fn build_cert_tree(
 
     // ── Signature ──
     let sig_algo = oid_name(&cert.signature_algorithm.algorithm.to_id_string());
-    let sig_data = &cert.signature_value.data;
-    let sig_range = compute_field_range(cert_der, sig_data, cert_range.offset());
+    let sig_algo_range = cert_spans.as_ref().map(|s| s.signature_algorithm);
+    let sig_value_range = cert_spans.as_ref().map(|s| s.signature_value);
     children.push(AnalysisNode {
         id: NodeId::new(),
         label: "Signature".into(),
         kind: "x509_signature".into(),
-        range: sig_range.unwrap_or(cert_range),
+        range: sig_value_range.unwrap_or(cert_range),
         children: Vec::new(),
         fields: vec![
             FieldView {
                 name: "Algorithm".into(),
                 value: sig_algo,
-                range: None,
+                range: sig_algo_range,
             },
             FieldView {
                 name: "Size".into(),
-                value: format!("{} bytes", sig_data.len()),
-                range: sig_range,
+                value: format!("{} bytes", cert.signature_value.data.len()),
+                range: sig_value_range,
             },
         ],
         diagnostics: Vec::new(),
@@ -232,7 +255,10 @@ pub fn build_cert_tree(
         id: NodeId::new(),
         label: label.into(),
         kind: "x509_certificate".into(),
-        range: cert_range,
+        range: cert_spans
+            .as_ref()
+            .map(|s| s.certificate)
+            .unwrap_or(cert_range),
         children,
         fields: cert_fields,
         diagnostics: cert_diagnostics,

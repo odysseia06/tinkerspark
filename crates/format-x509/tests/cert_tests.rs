@@ -83,3 +83,94 @@ fn rejects_garbage_data() {
     let result = analyzer.analyze(&handle, &src);
     assert!(result.is_err(), "should fail on garbage data");
 }
+
+#[test]
+fn parses_der_certificate_with_precise_spans() {
+    let data = std::fs::read("../../testdata/x509/self-signed.der").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::X509Der, data.len() as u64);
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+
+    assert_eq!(report.analyzer_id, "x509");
+    let cert = &report.root_nodes[0];
+    assert_eq!(cert.kind, "x509_certificate");
+
+    // Certificate range should span the entire DER file.
+    assert_eq!(cert.range.offset(), 0);
+    assert_eq!(cert.range.length(), data.len() as u64);
+
+    // Each major child node should have a non-cert-range span
+    // (i.e. a precise sub-range, not the whole file).
+    let issuer = cert
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_issuer")
+        .unwrap();
+    assert!(
+        issuer.range.length() < cert.range.length(),
+        "Issuer should have a precise sub-range, not the full cert"
+    );
+    assert!(issuer.range.offset() > 0);
+
+    let subject = cert
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_subject")
+        .unwrap();
+    assert!(subject.range.length() < cert.range.length());
+
+    let validity = cert
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_validity")
+        .unwrap();
+    assert!(validity.range.length() < cert.range.length());
+
+    let pubkey = cert
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_public_key")
+        .unwrap();
+    assert!(pubkey.range.length() < cert.range.length());
+
+    let sig = cert
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_signature")
+        .unwrap();
+    assert!(sig.range.length() < cert.range.length());
+
+    // Extensions node range should also be precise (for v3 certs).
+    if let Some(exts) = cert.children.iter().find(|c| c.kind == "x509_extensions") {
+        assert!(exts.range.length() < cert.range.length());
+    }
+
+    // No PEM diagnostic for DER input.
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("PEM-encoded")),
+        "DER cert should not have PEM diagnostic"
+    );
+
+    // Version field should have a range (from TLV walking).
+    let version_field = cert.fields.iter().find(|f| f.name == "Version").unwrap();
+    assert!(
+        version_field.range.is_some(),
+        "Version field should have a DER span"
+    );
+
+    // Serial field should have a range.
+    let serial_field = cert
+        .fields
+        .iter()
+        .find(|f| f.name == "Serial Number")
+        .unwrap();
+    assert!(
+        serial_field.range.is_some(),
+        "Serial field should have a DER span"
+    );
+}

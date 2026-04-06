@@ -4,6 +4,7 @@
 //! Parses certificate structure, extracts fields, and maps them
 //! back to byte ranges in the source data.
 
+mod der_spans;
 mod pem_decode;
 mod tree_builder;
 
