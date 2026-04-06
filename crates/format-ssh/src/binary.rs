@@ -374,8 +374,9 @@ pub fn parse_private_section(
 
     let actually_limited = multi_key && (keys.len() as u32) < nkeys;
 
-    // Only label remaining bytes as padding if we actually finished parsing
-    // all keys. Otherwise, the remainder contains undecoded key material.
+    // Classify trailing bytes: only label as padding if the bytes actually
+    // match the OpenSSH padding pattern (1, 2, 3, ...). Otherwise, treat
+    // as unparsed/invalid remainder.
     let remaining = if cur.pos < data.len() {
         Some(Span {
             offset: section_offset + cur.pos,
@@ -384,10 +385,16 @@ pub fn parse_private_section(
     } else {
         None
     };
-    let (padding_span, unparsed_remainder) = if actually_limited {
-        (None, remaining)
-    } else {
-        (remaining, None)
+    let (padding_span, unparsed_remainder) = match remaining {
+        None => (None, None),
+        Some(span) if actually_limited => (None, Some(span)),
+        Some(span) => {
+            if looks_like_padding(&data[cur.pos..]) {
+                (Some(span), None)
+            } else {
+                (None, Some(span))
+            }
+        }
     };
 
     Ok(ParsedPrivateSection {
@@ -657,6 +664,43 @@ mod tests {
         assert!(looks_like_padding(&[1, 2, 3, 4, 5, 6, 7]));
         assert!(!looks_like_padding(&[0]));
         assert!(!looks_like_padding(&[1, 2, 4]));
+    }
+
+    #[test]
+    fn bad_trailing_bytes_not_labeled_as_padding() {
+        // Valid Ed25519 key followed by junk instead of proper 1,2,3,... padding.
+        let fake_pubkey = [0xAA; 32];
+        let fake_combined = [0xBB; 64];
+        let private_section = {
+            let mut sec = Vec::new();
+            sec.extend(42u32.to_be_bytes());
+            sec.extend(42u32.to_be_bytes());
+            sec.extend(build_string(b"ssh-ed25519"));
+            sec.extend(build_string(&fake_pubkey));
+            sec.extend(build_string(&fake_combined));
+            sec.extend(build_string(b"comment"));
+            sec.extend([0xFF, 0xFE, 0xFD]); // junk, not valid padding
+            sec
+        };
+        let data = build_minimal_container("none", 1, b"fakepubkey", &private_section);
+
+        let container = parse_container(&data).unwrap();
+        let priv_sec = parse_private_section(
+            &container.private_section.value,
+            container.nkeys,
+            container.private_section.value_span.offset,
+        )
+        .unwrap();
+
+        assert_eq!(priv_sec.keys.len(), 1);
+        assert!(
+            priv_sec.padding_span.is_none(),
+            "junk trailing bytes must not be labeled as padding"
+        );
+        assert!(
+            priv_sec.unparsed_remainder.is_some(),
+            "junk trailing bytes should be unparsed_remainder"
+        );
     }
 
     #[test]

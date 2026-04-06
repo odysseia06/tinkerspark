@@ -684,8 +684,14 @@ fn parse_unencrypted_private_section(
         });
     }
 
-    // Unparsed remainder (when parsing stopped early on a multi-key container).
+    // Unparsed remainder: either multi-key early stop, or invalid trailing bytes.
     if let Some(rem) = section.unparsed_remainder {
+        let diag_msg = if section.multi_key_limited {
+            "Contains undecoded key material from unsupported algorithms".to_string()
+        } else {
+            "Trailing bytes do not match expected OpenSSH padding pattern; data may be corrupt"
+                .to_string()
+        };
         children.push(AnalysisNode {
             id: NodeId::new(),
             label: format!("Unparsed Remainder ({} bytes)", rem.length),
@@ -698,8 +704,12 @@ fn parse_unencrypted_private_section(
                 range: Some(rem.to_range(base)),
             }],
             diagnostics: vec![Diagnostic {
-                severity: Severity::Info,
-                message: "Contains undecoded key material from unsupported algorithms".into(),
+                severity: if section.multi_key_limited {
+                    Severity::Info
+                } else {
+                    Severity::Warning
+                },
+                message: diag_msg,
                 range: Some(rem.to_range(base)),
             }],
         });
