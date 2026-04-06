@@ -474,6 +474,16 @@ fn parse_unencrypted_private_section(
         });
     }
 
+    if section.multi_key_limited {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            message: "Container holds multiple keys; only the first key was parsed. \
+                      Multi-key private section parsing is not yet supported."
+                .into(),
+            range: None,
+        });
+    }
+
     // Key entries.
     for (i, key) in section.keys.iter().enumerate() {
         let keytype_str = key.keytype.as_str().unwrap_or("<binary>").to_string();

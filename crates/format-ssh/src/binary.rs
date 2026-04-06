@@ -85,6 +85,8 @@ pub struct ParsedPrivateSection {
     pub keys: Vec<PrivateKeyEntry>,
     pub padding_span: Option<Span>,
     pub checkints_match: bool,
+    /// True when nkeys > 1 and only the first key was parsed.
+    pub multi_key_limited: bool,
 }
 
 /// A single private key entry within the private section.
@@ -278,22 +280,23 @@ pub fn parse_private_section(
         length: ci2_span.length,
     };
 
-    let mut keys = Vec::with_capacity(nkeys as usize);
-    for _ in 0..nkeys {
+    // The comment/padding heuristic only works reliably for a single key.
+    // With multiple keys the bytes after key 0 are key 1, not padding, so the
+    // probe would consume subsequent keys. Until algorithm-aware per-key
+    // parsing is implemented, we only parse the first key.
+    let parse_count = 1;
+    let multi_key = nkeys > 1;
+
+    let mut keys = Vec::with_capacity(parse_count);
+    for _ in 0..parse_count {
         let entry_start = cur.pos;
 
         let keytype = cur.read_string()?;
 
-        // Skip algorithm-specific fields until we find the comment.
-        // Strategy: the comment is the last string before padding. We know
-        // the key data is everything between keytype and comment.
-        // We scan forward looking for plausible comment boundaries.
-        //
-        // Simpler approach: read strings until we find one that looks like a
-        // comment (printable text, or empty) followed by padding or EOF.
-        // Since we can't know the exact field count per algorithm, we use
-        // a heuristic: keep reading strings and treat the last successful
-        // one before padding as the comment.
+        // Heuristic: read length-prefixed strings until the remainder looks
+        // like OpenSSH padding (1, 2, 3, ...).  The last string consumed is
+        // the comment; everything between keytype and comment is key data.
+        // This is only safe for the final (or only) key in the section.
 
         let key_data_start = cur.pos;
         let mut last_string_before_comment = None;
@@ -311,11 +314,9 @@ pub fn parse_private_section(
                     break;
                 }
             }
-            // Check if remaining bytes look like padding (1..N repeating).
             if looks_like_padding(&data[cur.pos..]) {
                 break;
             }
-            // Safety valve: if we've consumed most of the data, stop.
             if cur.remaining() < 4 {
                 break;
             }
@@ -324,7 +325,6 @@ pub fn parse_private_section(
         let (comment_field_start, comment) = match last_string_before_comment {
             Some((off, s)) => (off, s),
             None => {
-                // No strings found after keytype — treat as empty comment.
                 let empty = StringField {
                     full_span: Span {
                         offset: section_offset + cur.pos,
@@ -340,7 +340,6 @@ pub fn parse_private_section(
             }
         };
 
-        // Restore cursor to after the comment.
         cur.pos = probe_pos;
 
         let key_data_end = comment_field_start;
@@ -405,6 +404,7 @@ pub fn parse_private_section(
         keys,
         padding_span,
         checkints_match: checkint1 == checkint2,
+        multi_key_limited: multi_key,
     })
 }
 
@@ -473,6 +473,7 @@ mod tests {
         )
         .unwrap();
         assert!(priv_sec.checkints_match);
+        assert!(!priv_sec.multi_key_limited);
         assert_eq!(priv_sec.checkint1, 42);
         assert_eq!(priv_sec.keys.len(), 1);
         assert_eq!(priv_sec.keys[0].keytype.as_str(), Some("ssh-ed25519"));
@@ -509,5 +510,53 @@ mod tests {
         assert!(looks_like_padding(&[1, 2, 3, 4, 5, 6, 7]));
         assert!(!looks_like_padding(&[0]));
         assert!(!looks_like_padding(&[1, 2, 4]));
+    }
+
+    #[test]
+    fn multi_key_container_parses_first_key_only() {
+        // Build a 2-key private section. The heuristic only parses key 0.
+        let private_section = {
+            let mut sec = Vec::new();
+            sec.extend(99u32.to_be_bytes()); // checkint1
+            sec.extend(99u32.to_be_bytes()); // checkint2
+                                             // Key 0
+            sec.extend(build_string(b"ssh-ed25519"));
+            sec.extend(build_string(b"\x00\x01\x02\x03")); // key data
+            sec.extend(build_string(b"first key"));
+            // Key 1
+            sec.extend(build_string(b"ssh-rsa"));
+            sec.extend(build_string(b"\x10\x11\x12\x13")); // key data
+            sec.extend(build_string(b"second key"));
+            sec.extend([1, 2, 3]); // padding
+            sec
+        };
+        // Container advertises 2 public keys and nkeys=2.
+        let mut data = AUTH_MAGIC.to_vec();
+        data.extend(build_string(b"none"));
+        data.extend(build_string(b"none"));
+        data.extend(build_string(b""));
+        data.extend(2u32.to_be_bytes());
+        data.extend(build_string(b"pub0"));
+        data.extend(build_string(b"pub1"));
+        data.extend(build_string(&private_section));
+
+        let container = parse_container(&data).unwrap();
+        assert_eq!(container.nkeys, 2);
+        assert_eq!(container.public_keys.len(), 2);
+
+        let priv_sec = parse_private_section(
+            &container.private_section.value,
+            container.nkeys,
+            container.private_section.value_span.offset,
+        )
+        .unwrap();
+
+        // Only the first key is parsed.
+        assert_eq!(priv_sec.keys.len(), 1);
+        assert_eq!(priv_sec.keys[0].keytype.as_str(), Some("ssh-ed25519"));
+        assert!(
+            priv_sec.multi_key_limited,
+            "should flag that multi-key parsing was limited"
+        );
     }
 }
