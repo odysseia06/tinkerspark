@@ -1,5 +1,5 @@
 [package]
-name = "tinkerspark-core-analyze"
+name = "tinkerspark-format-x509"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,5 +7,6 @@ license.workspace = true
 [dependencies]
 tinkerspark-core-types = { workspace = true }
 tinkerspark-core-bytes = { workspace = true }
-thiserror = { workspace = true }
+tinkerspark-core-analyze = { workspace = true }
+x509-parser = { workspace = true }
 tracing = { workspace = true }

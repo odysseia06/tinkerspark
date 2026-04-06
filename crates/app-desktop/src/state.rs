@@ -23,14 +23,23 @@ pub struct AnalysisState {
     pub report: AnalysisReport,
     /// Whether the analysis is stale (file has been edited since last run).
     pub stale: bool,
-    /// Whether the analyzed file was ASCII-armored. When true, packet byte
-    /// ranges refer to decoded binary content and cannot be mapped to file
-    /// offsets, so hex jump/highlight is disabled.
+    /// Whether the analyzed file was armored/PEM-encoded. When true, node byte
+    /// ranges refer to decoded content and cannot be mapped to file offsets, so
+    /// hex jump/highlight is disabled.
     pub armored: bool,
     /// The currently selected node in the structure tree, if any.
     pub selected_node: Option<NodeId>,
     /// Byte range of the selected node, for hex highlighting.
     pub selected_range: Option<ByteRange>,
+}
+
+/// Check whether an analysis report indicates that byte ranges refer to
+/// decoded content (armored/PEM-encoded) rather than the original file.
+fn has_decoded_ranges(report: &AnalysisReport) -> bool {
+    report
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("ASCII-armored") || d.message.contains("PEM-encoded"))
 }
 
 /// Which diff pane was scrolled most recently (for sync propagation).
@@ -377,7 +386,14 @@ impl AppState {
 impl AppState {
     pub fn new() -> Self {
         let mut registry = AnalyzerRegistry::new();
+        // Dedicated analyzers (highest confidence wins).
         registry.register(Box::new(tinkerspark_format_openpgp::OpenPgpAnalyzer));
+        registry.register(Box::new(tinkerspark_format_x509::X509Analyzer));
+        registry.register(Box::new(tinkerspark_format_ssh::SshAnalyzer));
+        registry.register(Box::new(tinkerspark_format_age::AgeAnalyzer));
+        registry.register(Box::new(tinkerspark_format_jwk::JwkAnalyzer));
+        // Generic fallback — always Low confidence, so dedicated analyzers win.
+        registry.register(Box::new(tinkerspark_format_generic::GenericAnalyzer));
 
         let session = tinkerspark_infra_session::load_session();
 
@@ -419,14 +435,12 @@ impl AppState {
                             "analysis complete"
                         );
                         self.status_message = Some(format!(
-                            "Opened: {} ({} packets)",
+                            "Opened: {} ({}: {} nodes)",
                             handle.path.display(),
+                            report.analyzer_id,
                             node_count,
                         ));
-                        let armored = report
-                            .diagnostics
-                            .iter()
-                            .any(|d| d.message.contains("ASCII-armored"));
+                        let armored = has_decoded_ranges(&report);
                         Some(AnalysisState {
                             report,
                             stale: false,
@@ -500,10 +514,7 @@ impl AppState {
         match self.registry.auto_analyze(&file.handle, &patched) {
             Some(Ok(report)) => {
                 let node_count = report.root_nodes.len();
-                let armored = report
-                    .diagnostics
-                    .iter()
-                    .any(|d| d.message.contains("ASCII-armored"));
+                let armored = has_decoded_ranges(&report);
                 *analysis = Some(AnalysisState {
                     report,
                     stale: false,
@@ -511,7 +522,7 @@ impl AppState {
                     selected_node: None,
                     selected_range: None,
                 });
-                self.status_message = Some(format!("Re-analyzed: {node_count} packets"));
+                self.status_message = Some(format!("Re-analyzed: {node_count} nodes"));
             }
             Some(Err(e)) => {
                 self.status_message = Some(format!("Re-analysis failed: {e}"));

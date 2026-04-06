@@ -48,13 +48,47 @@ impl AnalyzerRegistry {
 
     /// Run the best matching analyzer on the given file.
     /// Returns None if no analyzer matches.
+    ///
+    /// If the best-match analyzer returns a parse error, the registry tries
+    /// the next-best analyzer (and so on) so that the generic fallback can
+    /// still provide useful output for files that a dedicated analyzer rejects.
     pub fn auto_analyze(
         &self,
         handle: &FileHandle,
         src: &dyn ByteSource,
     ) -> Option<Result<AnalysisReport, AnalyzeError>> {
-        let (analyzer, _confidence) = self.best_match(handle, src)?;
-        Some(analyzer.analyze(handle, src))
+        // Collect all analyzers that express interest, sorted by confidence descending.
+        let mut candidates: Vec<(&dyn Analyzer, AnalyzerConfidence)> = self
+            .analyzers
+            .iter()
+            .filter_map(|a| {
+                let c = a.can_analyze(handle, src);
+                if c == AnalyzerConfidence::None {
+                    None
+                } else {
+                    Some((a.as_ref(), c))
+                }
+            })
+            .collect();
+        // Stable sort descending — preserves registration order for ties.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut last_err = None;
+        for (analyzer, _) in &candidates {
+            match analyzer.analyze(handle, src) {
+                Ok(report) => return Some(Ok(report)),
+                Err(e) => {
+                    tracing::debug!(
+                        analyzer = analyzer.id(),
+                        error = %e,
+                        "analyzer failed, trying next candidate"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        last_err.map(Err)
     }
 }
 

@@ -9,6 +9,11 @@ members = [
     "crates/core-diff",
     "crates/core-analyze",
     "crates/format-openpgp",
+    "crates/format-generic",
+    "crates/format-x509",
+    "crates/format-ssh",
+    "crates/format-age",
+    "crates/format-jwk",
     "crates/infra-io",
     "crates/infra-session",
 ]
@@ -27,6 +32,11 @@ tinkerspark-core-patch = { path = "crates/core-patch" }
 tinkerspark-core-diff = { path = "crates/core-diff" }
 tinkerspark-core-analyze = { path = "crates/core-analyze" }
 tinkerspark-format-openpgp = { path = "crates/format-openpgp" }
+tinkerspark-format-generic = { path = "crates/format-generic" }
+tinkerspark-format-x509 = { path = "crates/format-x509" }
+tinkerspark-format-ssh = { path = "crates/format-ssh" }
+tinkerspark-format-age = { path = "crates/format-age" }
+tinkerspark-format-jwk = { path = "crates/format-jwk" }
 tinkerspark-infra-io = { path = "crates/infra-io" }
 tinkerspark-infra-session = { path = "crates/infra-session" }
 
@@ -46,3 +56,6 @@ tempfile = "3"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+x509-parser = { version = "0.16", default-features = false }
+ssh-key = { version = "0.6", default-features = false, features = ["std"] }
+base64 = "0.22"

@@ -1,5 +1,5 @@
 [package]
-name = "tinkerspark-core-analyze"
+name = "tinkerspark-format-age"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,5 +7,5 @@ license.workspace = true
 [dependencies]
 tinkerspark-core-types = { workspace = true }
 tinkerspark-core-bytes = { workspace = true }
-thiserror = { workspace = true }
+tinkerspark-core-analyze = { workspace = true }
 tracing = { workspace = true }

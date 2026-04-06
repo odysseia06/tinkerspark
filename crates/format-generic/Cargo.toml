@@ -1,0 +1,18 @@
+[package]
+name = "tinkerspark-format-generic"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tinkerspark-core-types = { workspace = true }
+tinkerspark-core-bytes = { workspace = true }
+tinkerspark-core-analyze = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tinkerspark-format-openpgp = { workspace = true }
+tinkerspark-format-x509 = { workspace = true }
+tinkerspark-format-ssh = { workspace = true }
+tinkerspark-format-age = { workspace = true }
+tinkerspark-format-jwk = { workspace = true }
