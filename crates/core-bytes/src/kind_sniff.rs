@@ -64,17 +64,19 @@ fn looks_like_openpgp_binary(header: &[u8]) -> bool {
     )
 }
 
-/// Conservative check for DER-encoded X.509: starts with ASN.1 SEQUENCE tag
-/// (0x30) and has a plausible DER length encoding.
+/// Conservative check for DER-encoded X.509 certificate.
+///
+/// A certificate is SEQUENCE { SEQUENCE (TBS), AlgId, BitString }.
+/// We check: outer SEQUENCE with valid DER length whose first content byte
+/// is another SEQUENCE (0x30). This rejects plain ASN.1/BER blobs that
+/// happen to start with 0x30 but are not certificates.
 fn looks_like_der_x509(header: &[u8], file_size: u64) -> bool {
     if header.len() < 4 || header[0] != 0x30 {
         return false;
     }
-    // Parse DER length to check plausibility.
+    // Parse outer DER length.
     let (content_len, header_len) = match header[1] {
-        // Short form: length < 128
         n if n < 0x80 => (n as u64, 2u64),
-        // Long form: 0x81 = 1 byte length, 0x82 = 2 bytes, etc.
         0x81 if header.len() >= 3 => (header[2] as u64, 3),
         0x82 if header.len() >= 4 => (u16::from_be_bytes([header[2], header[3]]) as u64, 4),
         0x83 if header.len() >= 5 => {
@@ -83,10 +85,13 @@ fn looks_like_der_x509(header: &[u8], file_size: u64) -> bool {
         }
         _ => return false,
     };
-    // Total DER object size should be close to file size (within reason).
     let total = header_len + content_len;
-    // Must be at least 20 bytes (tiny cert) and not exceed file size.
-    total >= 20 && total <= file_size
+    if total < 20 || total > file_size {
+        return false;
+    }
+    // The first content byte must be 0x30 (inner SEQUENCE = TBSCertificate).
+    let inner = header_len as usize;
+    inner < header.len() && header[inner] == 0x30
 }
 
 /// File extensions we treat as OpenPGP candidates.
@@ -380,5 +385,18 @@ mod tests {
         let header = b"-----BEGIN PGP MESSAGE-----\ndata";
         let kind = sniff_kind(header, &PathBuf::from("msg.asc"), header.len() as u64);
         assert_eq!(kind, DetectedKind::OpenPgpArmored);
+    }
+
+    #[test]
+    fn non_certificate_der_is_not_x509() {
+        // Outer SEQUENCE whose first content byte is INTEGER (0x02), not SEQUENCE.
+        // This is valid ASN.1 but not a certificate.
+        let header = &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+        let kind = sniff_kind(header, &PathBuf::from("data.der"), 8);
+        assert_ne!(
+            kind,
+            DetectedKind::X509Der,
+            "plain ASN.1 should not be X509Der"
+        );
     }
 }

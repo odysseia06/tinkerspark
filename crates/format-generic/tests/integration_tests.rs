@@ -382,3 +382,48 @@ fn jwk_set_children_have_nonempty_ranges() {
         );
     }
 }
+
+// Low: best_match() should not return x509 for CRL/CSR PEM.
+#[test]
+fn best_match_does_not_return_x509_for_crl_pem() {
+    let data = b"-----BEGIN X509 CRL-----\nMIIBFake==\n-----END X509 CRL-----\n";
+    let src = MemoryByteSource::new(data.to_vec());
+    let handle = make_handle("crl.pem", DetectedKind::Pem, data.len() as u64);
+    let registry = build_registry();
+
+    let (analyzer, _) = registry.best_match(&handle, &src).unwrap();
+    assert_ne!(
+        analyzer.id(),
+        "x509",
+        "best_match should not return x509 for CRL PEM"
+    );
+}
+
+#[test]
+fn best_match_does_not_return_x509_for_csr_pem() {
+    let data =
+        b"-----BEGIN CERTIFICATE REQUEST-----\nMIIBFake==\n-----END CERTIFICATE REQUEST-----\n";
+    let src = MemoryByteSource::new(data.to_vec());
+    let handle = make_handle("csr.pem", DetectedKind::Pem, data.len() as u64);
+    let registry = build_registry();
+
+    let (analyzer, _) = registry.best_match(&handle, &src).unwrap();
+    assert_ne!(
+        analyzer.id(),
+        "x509",
+        "best_match should not return x509 for CSR PEM"
+    );
+}
+
+// Medium: sniff_kind on non-certificate DER should not yield X509Der.
+#[test]
+fn sniff_kind_non_cert_der_not_x509() {
+    // SEQUENCE { INTEGER 1, INTEGER 2 } — valid ASN.1, not a certificate.
+    let data: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+    let kind = tinkerspark_core_bytes::sniff_kind(data, std::path::Path::new("data.der"), 8);
+    assert_ne!(
+        kind,
+        DetectedKind::X509Der,
+        "non-certificate ASN.1 should not be sniffed as X509Der"
+    );
+}

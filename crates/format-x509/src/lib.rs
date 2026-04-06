@@ -22,13 +22,12 @@ impl Analyzer for X509Analyzer {
         match &handle.kind {
             DetectedKind::X509Pem | DetectedKind::X509Der => AnalyzerConfidence::High,
             // Generic PEM might be an X.509 cert we didn't specifically match.
+            // Only claim actual certificate labels — not CRLs or CSRs.
+            // Match the full closing dashes to avoid "BEGIN CERTIFICATE" matching
+            // inside "BEGIN CERTIFICATE REQUEST".
             DetectedKind::Pem => {
-                // Peek at content for certificate-like PEM labels.
                 if let Ok(data) = src.read_range(ByteRange::new(0, src.len().min(256))) {
-                    if data
-                        .windows(17)
-                        .any(|w| w == b"BEGIN CERTIFICATE" || w == b"BEGIN X509")
-                    {
+                    if data.windows(22).any(|w| w == b"BEGIN CERTIFICATE-----") {
                         return AnalyzerConfidence::High;
                     }
                 }
