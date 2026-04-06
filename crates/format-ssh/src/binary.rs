@@ -83,9 +83,15 @@ pub struct ParsedPrivateSection {
     pub checkint2: u32,
     pub checkint2_span: Span,
     pub keys: Vec<PrivateKeyEntry>,
+    /// Validated OpenSSH padding (1, 2, 3, ...). Only set when the bytes
+    /// were actually checked; never set for undecoded remainder.
     pub padding_span: Option<Span>,
+    /// Undecoded bytes remaining after parsing stopped early. Distinct from
+    /// padding — these bytes were not validated.
+    pub unparsed_remainder: Option<Span>,
     pub checkints_match: bool,
-    /// True when nkeys > 1 and only the first key was parsed.
+    /// True when parsing stopped before reaching all keys in a multi-key
+    /// container (e.g. an unsupported algorithm in a non-final position).
     pub multi_key_limited: bool,
 }
 
@@ -353,8 +359,11 @@ pub fn parse_private_section(
         });
     }
 
-    // Remaining bytes are padding.
-    let padding_span = if cur.pos < data.len() {
+    let actually_limited = multi_key && (keys.len() as u32) < nkeys;
+
+    // Only label remaining bytes as padding if we actually finished parsing
+    // all keys. Otherwise, the remainder contains undecoded key material.
+    let remaining = if cur.pos < data.len() {
         Some(Span {
             offset: section_offset + cur.pos,
             length: data.len() - cur.pos,
@@ -362,8 +371,11 @@ pub fn parse_private_section(
     } else {
         None
     };
-
-    let actually_limited = multi_key && (keys.len() as u32) < nkeys;
+    let (padding_span, unparsed_remainder) = if actually_limited {
+        (None, remaining)
+    } else {
+        (remaining, None)
+    };
 
     Ok(ParsedPrivateSection {
         checkint1,
@@ -372,6 +384,7 @@ pub fn parse_private_section(
         checkint2_span: ci2_span,
         keys,
         padding_span,
+        unparsed_remainder,
         checkints_match: checkint1 == checkint2,
         multi_key_limited: actually_limited,
     })
@@ -549,6 +562,7 @@ mod tests {
         assert_eq!(priv_sec.keys[0].keytype.as_str(), Some("ssh-ed25519"));
         assert_eq!(priv_sec.keys[0].comment.as_str(), Some("test comment"));
         assert!(priv_sec.padding_span.is_some());
+        assert!(priv_sec.unparsed_remainder.is_none());
         // Ed25519 fields should be decoded.
         match &priv_sec.keys[0].key_fields {
             KeyFields::Ed25519 { pubkey, combined } => {
@@ -687,6 +701,8 @@ mod tests {
         assert_eq!(priv_sec.keys[1].comment.as_str(), Some("second key"));
         // Not limited because the opaque key is the last one (heuristic is safe).
         assert!(!priv_sec.multi_key_limited);
+        assert!(priv_sec.padding_span.is_some());
+        assert!(priv_sec.unparsed_remainder.is_none());
     }
 
     #[test]
@@ -738,6 +754,15 @@ mod tests {
         assert!(
             priv_sec.multi_key_limited,
             "should flag limitation: opaque non-final key stopped parsing"
+        );
+        // Remainder must NOT be labeled as padding — it contains undecoded key material.
+        assert!(
+            priv_sec.padding_span.is_none(),
+            "undecoded remainder must not be labeled as padding"
+        );
+        assert!(
+            priv_sec.unparsed_remainder.is_some(),
+            "should have unparsed_remainder for the undecoded bytes"
         );
     }
 }

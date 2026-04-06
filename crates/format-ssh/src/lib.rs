@@ -477,10 +477,11 @@ fn parse_unencrypted_private_section(
     if section.multi_key_limited {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
-            message: "Container holds multiple keys; only the first key was parsed. \
-                      Multi-key private section parsing is not yet supported."
-                .into(),
-            range: None,
+            message:
+                "Parsing stopped before the end of a multi-key container; \
+                      remaining keys were not parsed (unsupported algorithm in non-final position)."
+                    .into(),
+            range: section.unparsed_remainder.map(|s| s.to_range(base)),
         });
     }
 
@@ -604,7 +605,7 @@ fn parse_unencrypted_private_section(
         });
     }
 
-    // Padding.
+    // Padding (only when all keys were parsed and remainder is validated padding).
     if let Some(pad) = section.padding_span {
         children.push(AnalysisNode {
             id: NodeId::new(),
@@ -618,6 +619,27 @@ fn parse_unencrypted_private_section(
                 range: Some(pad.to_range(base)),
             }],
             diagnostics: Vec::new(),
+        });
+    }
+
+    // Unparsed remainder (when parsing stopped early on a multi-key container).
+    if let Some(rem) = section.unparsed_remainder {
+        children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("Unparsed Remainder ({} bytes)", rem.length),
+            kind: "ssh_unparsed".into(),
+            range: rem.to_range(base),
+            children: Vec::new(),
+            fields: vec![FieldView {
+                name: "Size".into(),
+                value: format!("{} bytes", rem.length),
+                range: Some(rem.to_range(base)),
+            }],
+            diagnostics: vec![Diagnostic {
+                severity: Severity::Info,
+                message: "Contains undecoded key material from unsupported algorithms".into(),
+                range: Some(rem.to_range(base)),
+            }],
         });
     }
 
