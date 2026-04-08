@@ -19,11 +19,58 @@ pub struct OpenFile {
     pub patches: PatchHistory,
 }
 
+/// Why an `AnalysisState` is stale, if at all.
+///
+/// Modeled as a three-way enum (rather than a `bool`) because the desktop
+/// surfaces a different message and a different remediation hint depending
+/// on which event invalidated the cached report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnalysisFreshness {
+    /// The cached report reflects the current file contents and the current
+    /// analyzer settings.
+    #[default]
+    Fresh,
+    /// The user edited the file (or undid/redid an edit) after the report
+    /// was produced. The report itself is still well-formed, just outdated.
+    FileModified,
+    /// A bulk reanalysis pass (e.g., a sensitivity-mode change) failed for
+    /// this tab. The previously cached report is preserved so the user
+    /// retains some context, but it was generated under a different setting
+    /// than the live one.
+    RefreshFailed,
+}
+
+impl AnalysisFreshness {
+    /// Short label suitable for the structure pane headline next to the
+    /// Re-analyze button. Returns `None` when fresh.
+    pub fn short_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Fresh => None,
+            Self::FileModified => Some("Analysis is stale (file modified)"),
+            Self::RefreshFailed => Some("Analysis is stale (refresh failed)"),
+        }
+    }
+
+    /// Longer detail string for the diagnostics pane. Returns `None` when fresh.
+    pub fn detail(&self) -> Option<&'static str> {
+        match self {
+            Self::Fresh => None,
+            Self::FileModified => {
+                Some("Analysis is stale — results may not reflect current edits.")
+            }
+            Self::RefreshFailed => Some(
+                "Analysis is stale — last refresh failed; results were generated under a previous setting.",
+            ),
+        }
+    }
+}
+
 /// Analysis state for an open file.
 pub struct AnalysisState {
     pub report: AnalysisReport,
-    /// Whether the analysis is stale (file has been edited since last run).
-    pub stale: bool,
+    /// Whether the cached report is fresh and, if not, why. See
+    /// [`AnalysisFreshness`].
+    pub freshness: AnalysisFreshness,
     /// Whether the analyzed file was armored/PEM-encoded. When true, node byte
     /// ranges refer to decoded content and cannot be mapped to file offsets, so
     /// hex jump/highlight is disabled.
@@ -460,7 +507,7 @@ impl AppState {
                     let armored = has_decoded_ranges(&report);
                     *analysis = Some(AnalysisState {
                         report,
-                        stale: false,
+                        freshness: AnalysisFreshness::Fresh,
                         armored,
                         selected_node: None,
                         selected_range: None,
@@ -470,7 +517,7 @@ impl AppState {
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, "bulk reanalysis failed for tab");
                     if let Some(existing) = analysis.as_mut() {
-                        existing.stale = true;
+                        existing.freshness = AnalysisFreshness::RefreshFailed;
                     }
                     failed += 1;
                 }
@@ -509,7 +556,7 @@ impl AppState {
                         let armored = has_decoded_ranges(&report);
                         Some(AnalysisState {
                             report,
-                            stale: false,
+                            freshness: AnalysisFreshness::Fresh,
                             armored,
                             selected_node: None,
                             selected_range: None,
@@ -540,13 +587,14 @@ impl AppState {
         }
     }
 
-    /// Mark the analysis as stale (called after patching).
+    /// Mark the analysis as stale because the file was edited (patched, undone,
+    /// or redone). Used by edit handlers to prompt the user to re-analyze.
     pub fn mark_analysis_stale(&mut self) {
         if let Some(WorkspaceTab::File {
             analysis: Some(a), ..
         }) = self.active_tab_mut()
         {
-            a.stale = true;
+            a.freshness = AnalysisFreshness::FileModified;
         }
     }
 
@@ -584,7 +632,7 @@ impl AppState {
                 let armored = has_decoded_ranges(&report);
                 *analysis = Some(AnalysisState {
                     report,
-                    stale: false,
+                    freshness: AnalysisFreshness::Fresh,
                     armored,
                     selected_node: None,
                     selected_range: None,
@@ -754,7 +802,7 @@ mod tests {
         let analysis = match analysis_result {
             Some(Ok(report)) => Some(AnalysisState {
                 report,
-                stale: false,
+                freshness: AnalysisFreshness::Fresh,
                 armored: false,
                 selected_node: None,
                 selected_range: None,
@@ -798,7 +846,7 @@ mod tests {
             file,
             analysis: Some(AnalysisState {
                 report,
-                stale: false,
+                freshness: AnalysisFreshness::Fresh,
                 armored: false,
                 selected_node: None,
                 selected_range: None,
@@ -890,6 +938,38 @@ mod tests {
     }
 
     #[test]
+    fn mark_analysis_stale_uses_file_modified_reason() {
+        let mut state = AppState::with_session(SessionState::default());
+        push_synthetic_file(&mut state, vec![0x42; 64]);
+        state.mark_analysis_stale();
+
+        let WorkspaceTab::File {
+            analysis: Some(a), ..
+        } = &state.tabs[0]
+        else {
+            panic!("expected file tab with analysis");
+        };
+        assert_eq!(a.freshness, AnalysisFreshness::FileModified);
+        let label = a.freshness.short_label().unwrap();
+        assert!(label.contains("modified"), "label: {label}");
+    }
+
+    #[test]
+    fn freshness_helpers_match_intent() {
+        assert!(AnalysisFreshness::Fresh.short_label().is_none());
+        assert!(AnalysisFreshness::Fresh.detail().is_none());
+
+        assert!(AnalysisFreshness::FileModified
+            .short_label()
+            .unwrap()
+            .contains("modified"));
+
+        let refresh_label = AnalysisFreshness::RefreshFailed.short_label().unwrap();
+        assert!(refresh_label.contains("refresh failed"));
+        assert!(!refresh_label.contains("modified"));
+    }
+
+    #[test]
     fn setting_same_sensitivity_is_a_noop() {
         let mut state = AppState::with_session(SessionState::default());
         push_synthetic_file(&mut state, vec![0x42; 64]);
@@ -934,7 +1014,11 @@ mod tests {
                 analysis: Some(a), ..
             } = tab
             {
-                assert!(!a.stale, "refreshed analysis must not be stale");
+                assert_eq!(
+                    a.freshness,
+                    AnalysisFreshness::Fresh,
+                    "refreshed analysis must not be stale"
+                );
             }
         }
     }
@@ -1000,9 +1084,31 @@ mod tests {
         else {
             panic!("tab 1 should still hold its seeded analysis");
         };
+        assert_eq!(
+            failing_analysis.freshness,
+            AnalysisFreshness::RefreshFailed,
+            "failing tab's prior analysis must be flagged with the refresh-failed reason"
+        );
+        // The user-visible messaging must NOT blame edits in this case.
+        let short = failing_analysis
+            .freshness
+            .short_label()
+            .expect("stale analysis should have a label");
         assert!(
-            failing_analysis.stale,
-            "failing tab's prior analysis must be flagged stale"
+            !short.contains("modified"),
+            "refresh-failure label must not say 'modified': {short}"
+        );
+        assert!(
+            short.contains("refresh failed"),
+            "refresh-failure label should name the cause: {short}"
+        );
+        let detail = failing_analysis
+            .freshness
+            .detail()
+            .expect("stale analysis should have a detail string");
+        assert!(
+            !detail.contains("edits"),
+            "refresh-failure detail must not blame edits: {detail}"
         );
 
         let WorkspaceTab::File {
@@ -1012,8 +1118,9 @@ mod tests {
         else {
             panic!("tab 0 should hold its refreshed analysis");
         };
-        assert!(
-            !healthy_analysis.stale,
+        assert_eq!(
+            healthy_analysis.freshness,
+            AnalysisFreshness::Fresh,
             "successfully refreshed tab must not be marked stale"
         );
 

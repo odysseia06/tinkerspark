@@ -258,12 +258,9 @@ fn render_structure_pane(ui: &mut Ui, state: &mut AppState) {
     };
 
     let mut wants_reanalyze = false;
-    if analysis.stale {
+    if let Some(label) = analysis.freshness.short_label() {
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Analysis is stale (file modified)")
-                    .color(egui::Color32::from_rgb(255, 180, 50)),
-            );
+            ui.label(egui::RichText::new(label).color(egui::Color32::from_rgb(255, 180, 50)));
             if ui.button("Re-analyze").clicked() {
                 wants_reanalyze = true;
             }
@@ -382,11 +379,8 @@ fn render_diagnostics_pane(ui: &mut Ui, state: &AppState) {
         return;
     };
 
-    if analysis.stale {
-        ui.label(
-            egui::RichText::new("Analysis is stale — results may not reflect current edits.")
-                .color(egui::Color32::from_rgb(255, 180, 50)),
-        );
+    if let Some(detail) = analysis.freshness.detail() {
+        ui.label(egui::RichText::new(detail).color(egui::Color32::from_rgb(255, 180, 50)));
         ui.separator();
     }
 
