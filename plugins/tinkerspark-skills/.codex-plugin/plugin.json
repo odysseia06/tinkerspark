@@ -1,0 +1,22 @@
+{
+  "name": "tinkerspark-skills",
+  "version": "0.1.0",
+  "description": "Repository-local Codex skills for Tinkerspark.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tinkerspark Skills",
+    "shortDescription": "Repo-local Codex skills for Tinkerspark",
+    "longDescription": "Provide repository-scoped Codex skills for Tinkerspark workflows and review tasks.",
+    "developerName": "Tinkerspark",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use the Tinkerspark skills for repository-specific workflows"
+    ],
+    "screenshots": [],
+    "brandColor": "#2F6B5F"
+  }
+}
