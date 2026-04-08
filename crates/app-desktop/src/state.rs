@@ -425,7 +425,9 @@ impl AppState {
     /// up the new mode, persist the choice into the in-memory session, and
     /// re-run analysis on every open file tab so cached reports stay coherent
     /// with the live mode — not just the active tab. Diff tabs are skipped
-    /// because they hold no analyzer report.
+    /// because they hold no analyzer report. Per-tab failures during the
+    /// bulk refresh leave the old report in place but mark it stale, and the
+    /// failure count is surfaced in the status message.
     pub fn set_generic_sensitivity(&mut self, mode: Sensitivity) {
         if self.generic_sensitivity == mode {
             return;
@@ -433,25 +435,20 @@ impl AppState {
         self.generic_sensitivity = mode;
         self.registry = build_registry(mode);
         self.session.generic_sensitivity = Some(mode.label().to_string());
-        let refreshed = self.reanalyze_all_file_tabs();
-        self.status_message = Some(if refreshed == 0 {
-            format!("Generic analyzer sensitivity: {}", mode.label())
-        } else {
-            format!(
-                "Generic analyzer sensitivity: {} ({} tab{} reanalyzed)",
-                mode.label(),
-                refreshed,
-                if refreshed == 1 { "" } else { "s" }
-            )
-        });
+        let (refreshed, failed) = self.reanalyze_all_file_tabs();
+        self.status_message = Some(format_sensitivity_status(mode, refreshed, failed));
     }
 
     /// Re-run analysis on every open file tab using the current registry,
     /// reading through each tab's patch overlay so any pending edits are
-    /// included. Returns the number of file tabs whose analysis was
-    /// successfully refreshed. Diff tabs are left untouched.
-    pub fn reanalyze_all_file_tabs(&mut self) -> usize {
-        let mut refreshed = 0;
+    /// included. Returns `(refreshed, failed)`: the number of file tabs
+    /// whose analysis was successfully refreshed, and the number whose
+    /// reanalysis returned an error. On error the previous cached report is
+    /// retained but marked stale so the structure pane can warn the user
+    /// instead of presenting it as fresh. Diff tabs are left untouched.
+    pub fn reanalyze_all_file_tabs(&mut self) -> (usize, usize) {
+        let mut refreshed = 0usize;
+        let mut failed = 0usize;
         for tab in self.tabs.iter_mut() {
             let WorkspaceTab::File { file, analysis } = tab else {
                 continue;
@@ -472,13 +469,17 @@ impl AppState {
                 }
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, "bulk reanalysis failed for tab");
+                    if let Some(existing) = analysis.as_mut() {
+                        existing.stale = true;
+                    }
+                    failed += 1;
                 }
                 None => {
                     *analysis = None;
                 }
             }
         }
-        refreshed
+        (refreshed, failed)
     }
 
     pub fn open(&mut self, path: &Path) {
@@ -653,6 +654,27 @@ fn ranges_overlap(a: &ByteRange, b: &ByteRange) -> bool {
     a.offset() < b.end() && b.offset() < a.end()
 }
 
+/// Format the status-bar message after a sensitivity change. Aggregates the
+/// refreshed/failed counts so partial bulk-refresh failures are visible to
+/// the user instead of being silently swallowed.
+fn format_sensitivity_status(mode: Sensitivity, refreshed: usize, failed: usize) -> String {
+    let label = mode.label();
+    match (refreshed, failed) {
+        (0, 0) => format!("Generic analyzer sensitivity: {label}"),
+        (r, 0) => format!(
+            "Generic analyzer sensitivity: {label} ({r} tab{} reanalyzed)",
+            if r == 1 { "" } else { "s" }
+        ),
+        (0, f) => format!(
+            "Generic analyzer sensitivity: {label} ({f} tab{} failed — showing stale results)",
+            if f == 1 { "" } else { "s" }
+        ),
+        (r, f) => format!(
+            "Generic analyzer sensitivity: {label} ({r} reanalyzed, {f} failed — showing stale results)"
+        ),
+    }
+}
+
 /// Build the analyzer registry with the given generic-fallback sensitivity.
 /// Dedicated analyzers always rank above the generic fallback by virtue of
 /// returning higher confidence levels.
@@ -685,9 +707,26 @@ fn open_as_openfile(path: &Path) -> Result<OpenFile, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::path::PathBuf;
-    use tinkerspark_core_bytes::MemoryByteSource;
+    use tinkerspark_core_bytes::{MemoryByteSource, ReadError};
     use tinkerspark_core_types::{DetectedKind, FileId};
+
+    /// A `ByteSource` whose `read_range` always errors. Used to drive the
+    /// per-tab failure path inside bulk reanalysis.
+    struct FailingByteSource {
+        len: u64,
+    }
+
+    impl ByteSource for FailingByteSource {
+        fn len(&self) -> u64 {
+            self.len
+        }
+
+        fn read_range(&self, _range: ByteRange) -> Result<Cow<'_, [u8]>, ReadError> {
+            Err(ReadError::Io(std::io::Error::other("synthetic failure")))
+        }
+    }
 
     fn synthetic_open_file(name: &str, data: Vec<u8>) -> OpenFile {
         let file_len = data.len() as u64;
@@ -723,6 +762,48 @@ mod tests {
             _ => None,
         };
         state.tabs.push(WorkspaceTab::File { file, analysis });
+        state.active_tab = state.tabs.len() - 1;
+    }
+
+    /// Push a tab whose ByteSource errors on every read, but seed it with a
+    /// healthy AnalysisState first so we can prove that bulk reanalysis
+    /// failure leaves the prior report in place and marks it stale.
+    fn push_failing_tab_with_seeded_analysis(state: &mut AppState) {
+        // Build the seed analysis from a real working source.
+        let seed = synthetic_open_file("seed.bin", vec![0x42; 64]);
+        let report = state
+            .registry
+            .auto_analyze(&seed.handle, &*seed.source)
+            .unwrap()
+            .unwrap();
+
+        // Then construct the actual tab with a failing source so any
+        // subsequent reanalyze hits the error branch.
+        let len = 64u64;
+        let handle = FileHandle {
+            id: FileId::new(),
+            path: PathBuf::from("failing.bin"),
+            size: len,
+            kind: DetectedKind::Binary,
+        };
+        let source: Box<dyn ByteSource> = Box::new(FailingByteSource { len });
+        let file = OpenFile {
+            handle,
+            source,
+            backend: BackendKind::Buffered,
+            hex: HexViewState::new(len),
+            patches: PatchHistory::new(len),
+        };
+        state.tabs.push(WorkspaceTab::File {
+            file,
+            analysis: Some(AnalysisState {
+                report,
+                stale: false,
+                armored: false,
+                selected_node: None,
+                selected_range: None,
+            }),
+        });
         state.active_tab = state.tabs.len() - 1;
     }
 
@@ -878,5 +959,68 @@ mod tests {
             Some("Conservative"),
             "file tab behind a diff tab should still be refreshed"
         );
+    }
+
+    #[test]
+    fn bulk_reanalysis_failure_marks_stale_and_reports_partial_success() {
+        let mut state = AppState::with_session(SessionState::default());
+        push_synthetic_file(&mut state, vec![0x42; 64]); // tab 0 — healthy
+        push_failing_tab_with_seeded_analysis(&mut state); // tab 1 — will fail
+
+        // Sanity: both tabs start under Balanced and neither is stale.
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 0).as_deref(),
+            Some("Balanced")
+        );
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 1).as_deref(),
+            Some("Balanced")
+        );
+
+        state.set_generic_sensitivity(Sensitivity::Aggressive);
+
+        // Healthy tab follows the new mode, failing tab keeps its old report
+        // (still labeled "Balanced" because that's what produced it) but is
+        // now flagged stale so the structure pane can warn the user.
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 0).as_deref(),
+            Some("Aggressive"),
+            "healthy tab must still refresh"
+        );
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 1).as_deref(),
+            Some("Balanced"),
+            "failing tab keeps its prior report (not silently dropped)"
+        );
+
+        let WorkspaceTab::File {
+            analysis: Some(failing_analysis),
+            ..
+        } = &state.tabs[1]
+        else {
+            panic!("tab 1 should still hold its seeded analysis");
+        };
+        assert!(
+            failing_analysis.stale,
+            "failing tab's prior analysis must be flagged stale"
+        );
+
+        let WorkspaceTab::File {
+            analysis: Some(healthy_analysis),
+            ..
+        } = &state.tabs[0]
+        else {
+            panic!("tab 0 should hold its refreshed analysis");
+        };
+        assert!(
+            !healthy_analysis.stale,
+            "successfully refreshed tab must not be marked stale"
+        );
+
+        // Status message must surface the partial failure so the user sees it.
+        let status = state.status_message.as_deref().unwrap_or_default();
+        assert!(status.contains("Aggressive"), "status: {status}");
+        assert!(status.contains("1 reanalyzed"), "status: {status}");
+        assert!(status.contains("1 failed"), "status: {status}");
     }
 }
