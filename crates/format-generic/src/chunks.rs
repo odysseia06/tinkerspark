@@ -31,14 +31,12 @@ impl DetectedChunk {
 /// Common alignment boundaries to check.
 const ALIGNMENTS: &[usize] = &[4, 8, 16, 32, 64, 512, 4096];
 
-/// Minimum number of records to consider a fixed-size pattern.
-const MIN_RECORD_COUNT: usize = 4;
-
-/// Minimum padding region size to report.
-const MIN_PADDING_SIZE: usize = 8;
-
 /// Detect padding regions (runs of identical bytes at alignment boundaries).
-pub fn detect_padding(data: &[u8], base_offset: u64) -> Vec<DetectedChunk> {
+pub fn detect_padding(
+    data: &[u8],
+    base_offset: u64,
+    min_padding_size: usize,
+) -> Vec<DetectedChunk> {
     let mut results = Vec::new();
     let mut i = 0;
 
@@ -54,7 +52,7 @@ pub fn detect_padding(data: &[u8], base_offset: u64) -> Vec<DetectedChunk> {
             i += 1;
         }
         let len = i - start;
-        if len >= MIN_PADDING_SIZE {
+        if len >= min_padding_size {
             // Check if it's at an alignment boundary.
             let at_alignment = ALIGNMENTS
                 .iter()
@@ -80,7 +78,11 @@ pub fn detect_padding(data: &[u8], base_offset: u64) -> Vec<DetectedChunk> {
 ///
 /// Looks for repeating structural patterns at common record sizes.
 /// Returns detected patterns sorted by confidence (most records first).
-pub fn detect_fixed_records(data: &[u8], base_offset: u64) -> Vec<DetectedChunk> {
+pub fn detect_fixed_records(
+    data: &[u8],
+    base_offset: u64,
+    min_record_count: usize,
+) -> Vec<DetectedChunk> {
     let mut results = Vec::new();
 
     // Try common record sizes.
@@ -89,11 +91,11 @@ pub fn detect_fixed_records(data: &[u8], base_offset: u64) -> Vec<DetectedChunk>
         .collect();
 
     for &size in &candidate_sizes {
-        if data.len() < size * MIN_RECORD_COUNT {
+        if data.len() < size * min_record_count {
             continue;
         }
         let count = data.len() / size;
-        if count < MIN_RECORD_COUNT {
+        if count < min_record_count {
             continue;
         }
 
@@ -136,11 +138,15 @@ pub fn detect_fixed_records(data: &[u8], base_offset: u64) -> Vec<DetectedChunk>
 /// Try to detect length-prefixed sections.
 ///
 /// Checks common length encodings: 1-byte, 2-byte BE, 4-byte BE.
-pub fn detect_length_prefixed(data: &[u8], base_offset: u64) -> Vec<DetectedChunk> {
+pub fn detect_length_prefixed(
+    data: &[u8],
+    base_offset: u64,
+    scan_window: usize,
+) -> Vec<DetectedChunk> {
     let mut results = Vec::new();
 
     // Try from the beginning and at various offsets.
-    let offsets_to_try: Vec<usize> = (0..data.len().min(64)).collect();
+    let offsets_to_try: Vec<usize> = (0..data.len().min(scan_window)).collect();
 
     for &start in &offsets_to_try {
         let remaining = &data[start..];
@@ -244,16 +250,23 @@ mod tests {
         let mut data = vec![0x42; 10];
         data.extend(vec![0x00; 32]);
         data.extend(vec![0x42; 10]);
-        let padding = detect_padding(&data, 0);
+        let padding = detect_padding(&data, 0, 8);
         assert_eq!(padding.len(), 1);
         assert_eq!(padding[0].offset, 10);
         assert_eq!(padding[0].length, 32);
     }
 
     #[test]
-    fn skips_short_padding() {
-        let data = vec![0x00; 4]; // too short
-        let padding = detect_padding(&data, 0);
+    fn skips_short_padding_with_default_threshold() {
+        let data = vec![0x00; 4]; // too short for the default 8-byte threshold
+        let padding = detect_padding(&data, 0, 8);
         assert!(padding.is_empty());
+    }
+
+    #[test]
+    fn lower_threshold_finds_short_padding() {
+        let data = vec![0x00; 4];
+        let padding = detect_padding(&data, 0, 4);
+        assert_eq!(padding.len(), 1, "4-byte threshold should accept this run");
     }
 }

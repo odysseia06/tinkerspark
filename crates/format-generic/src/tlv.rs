@@ -58,17 +58,18 @@ impl TlvEncoding {
     }
 }
 
-/// Maximum number of TLV chains to return.
-const MAX_CHAINS: usize = 5;
-
-/// Minimum chain length (elements) to report.
-const MIN_CHAIN_LEN: usize = 2;
-
 /// Try to detect TLV chains starting from offset 0.
 ///
-/// Conservative: only reports chains where multiple consecutive elements parse
-/// cleanly with no gaps or overlaps.
-pub fn detect_tlv_chains(data: &[u8], base_offset: u64) -> Vec<TlvChain> {
+/// Reports chains where consecutive elements parse cleanly with no gaps. The
+/// `min_chain_len` and `max_chains` parameters control how aggressively chains
+/// are reported — stricter values reduce false positives at the cost of
+/// missing short or weak chains.
+pub fn detect_tlv_chains(
+    data: &[u8],
+    base_offset: u64,
+    min_chain_len: usize,
+    max_chains: usize,
+) -> Vec<TlvChain> {
     let mut chains = Vec::new();
 
     // Try each encoding scheme.
@@ -77,8 +78,8 @@ pub fn detect_tlv_chains(data: &[u8], base_offset: u64) -> Vec<TlvChain> {
         TlvEncoding::Tag1Len2Be,
         TlvEncoding::Tag1Len4Be,
     ] {
-        if let Some(chain) = try_parse_chain(data, base_offset, encoding) {
-            if chain.elements.len() >= MIN_CHAIN_LEN {
+        if let Some(chain) = try_parse_chain(data, base_offset, encoding, min_chain_len) {
+            if chain.elements.len() >= min_chain_len {
                 chains.push(chain);
             }
         }
@@ -90,11 +91,16 @@ pub fn detect_tlv_chains(data: &[u8], base_offset: u64) -> Vec<TlvChain> {
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    chains.truncate(MAX_CHAINS);
+    chains.truncate(max_chains);
     chains
 }
 
-fn try_parse_chain(data: &[u8], base_offset: u64, encoding: TlvEncoding) -> Option<TlvChain> {
+fn try_parse_chain(
+    data: &[u8],
+    base_offset: u64,
+    encoding: TlvEncoding,
+    min_chain_len: usize,
+) -> Option<TlvChain> {
     let mut elements = Vec::new();
     let mut pos = 0;
 
@@ -116,7 +122,7 @@ fn try_parse_chain(data: &[u8], base_offset: u64, encoding: TlvEncoding) -> Opti
         }
     }
 
-    if elements.len() < MIN_CHAIN_LEN {
+    if elements.len() < min_chain_len {
         return None;
     }
 
@@ -254,7 +260,7 @@ mod tests {
             0x30, 0x03, 0x02, 0x01, 0x2A, // SEQUENCE { INTEGER 42 }
             0x30, 0x03, 0x02, 0x01, 0x2B, // SEQUENCE { INTEGER 43 }
         ];
-        let chains = detect_tlv_chains(data, 0);
+        let chains = detect_tlv_chains(data, 0, 2, 5);
         assert!(
             chains.iter().any(|c| c.encoding == TlvEncoding::Asn1Ber),
             "should detect ASN.1 BER chain"
@@ -267,9 +273,22 @@ mod tests {
     }
 
     #[test]
+    fn stricter_min_chain_len_rejects_short_chain() {
+        let data = &[
+            0x30, 0x03, 0x02, 0x01, 0x2A, // SEQUENCE { INTEGER 42 }
+            0x30, 0x03, 0x02, 0x01, 0x2B, // SEQUENCE { INTEGER 43 }
+        ];
+        let chains = detect_tlv_chains(data, 0, 3, 5);
+        assert!(
+            chains.is_empty(),
+            "min_chain_len=3 should reject a 2-element chain"
+        );
+    }
+
+    #[test]
     fn no_chain_on_random_data() {
         let data = &[0x00, 0x00, 0x00, 0x00];
-        let chains = detect_tlv_chains(data, 0);
+        let chains = detect_tlv_chains(data, 0, 2, 5);
         assert!(chains.is_empty(), "should not find chains in null data");
     }
 }

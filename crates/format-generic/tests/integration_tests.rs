@@ -20,7 +20,7 @@ fn build_registry() -> AnalyzerRegistry {
     registry.register(Box::new(tinkerspark_format_age::AgeAnalyzer));
     registry.register(Box::new(tinkerspark_format_jwk::JwkAnalyzer));
     // Generic fallback last.
-    registry.register(Box::new(tinkerspark_format_generic::GenericAnalyzer));
+    registry.register(Box::new(tinkerspark_format_generic::GenericAnalyzer::new()));
     registry
 }
 
@@ -137,7 +137,7 @@ fn truncated_der_does_not_panic() {
     assert!(result.is_err(), "truncated DER should fail gracefully");
 
     // Generic analyzer should still produce output.
-    let generic = tinkerspark_format_generic::GenericAnalyzer;
+    let generic = tinkerspark_format_generic::GenericAnalyzer::new();
     let report = generic.analyze(&handle, &src).unwrap();
     assert!(
         !report.root_nodes.is_empty(),
@@ -150,7 +150,7 @@ fn empty_file_generic_analysis() {
     let src = MemoryByteSource::new(Vec::new());
     let handle = make_handle("empty", DetectedKind::Empty, 0);
 
-    let generic = tinkerspark_format_generic::GenericAnalyzer;
+    let generic = tinkerspark_format_generic::GenericAnalyzer::new();
     let report = generic.analyze(&handle, &src).unwrap();
     assert!(
         !report.root_nodes.is_empty(),
@@ -198,7 +198,7 @@ fn malformed_age_does_not_panic() {
 
 #[test]
 fn generic_always_has_low_confidence() {
-    let generic = tinkerspark_format_generic::GenericAnalyzer;
+    let generic = tinkerspark_format_generic::GenericAnalyzer::new();
     let data = vec![0x42; 100];
     let src = MemoryByteSource::new(data);
     let handle = make_handle("test.bin", DetectedKind::Binary, 100);
@@ -211,7 +211,8 @@ fn dedicated_analyzers_have_higher_confidence_than_generic() {
 
     let x509_handle = make_handle("cert.pem", DetectedKind::X509Pem, 1);
     let x509_conf = tinkerspark_format_x509::X509Analyzer.can_analyze(&x509_handle, &src);
-    let generic_conf = tinkerspark_format_generic::GenericAnalyzer.can_analyze(&x509_handle, &src);
+    let generic_conf =
+        tinkerspark_format_generic::GenericAnalyzer::new().can_analyze(&x509_handle, &src);
     assert!(
         x509_conf > generic_conf,
         "X509 confidence should beat generic"

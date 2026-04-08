@@ -20,12 +20,115 @@ use tinkerspark_core_types::{ByteRange, Diagnostic, FileHandle, NodeId, Severity
 /// Maximum bytes to read for generic analysis (1 MiB).
 const MAX_ANALYSIS_SIZE: u64 = 1024 * 1024;
 
+/// User-selectable sensitivity for the generic analyzer.
+///
+/// Trades off between noise (false positives) and coverage (recall) when
+/// inspecting unknown binary formats. Each variant maps to a different set of
+/// thresholds for the underlying heuristic passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sensitivity {
+    /// Stricter thresholds, fewer candidates, less noise. Best when you want
+    /// only high-signal hits and are happy to miss weaker patterns.
+    Conservative,
+    /// Default thresholds — the historical out-of-the-box behavior.
+    #[default]
+    Balanced,
+    /// Loosest thresholds, surfaces weaker candidates and shorter chains. Best
+    /// for exploring genuinely unknown blobs where any signal helps.
+    Aggressive,
+}
+
+impl Sensitivity {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Conservative => "Conservative",
+            Self::Balanced => "Balanced",
+            Self::Aggressive => "Aggressive",
+        }
+    }
+
+    pub fn tunables(&self) -> Tunables {
+        match self {
+            Self::Conservative => Tunables {
+                min_string_len: 6,
+                max_strings: 100,
+                string_group_gap: 16,
+                min_padding_size: 16,
+                min_record_count: 6,
+                length_prefix_scan_window: 16,
+                min_tlv_chain_len: 3,
+                max_tlv_chains: 3,
+                confidence_warn_threshold: 0.5,
+            },
+            Self::Balanced => Tunables {
+                min_string_len: 4,
+                max_strings: 200,
+                string_group_gap: 32,
+                min_padding_size: 8,
+                min_record_count: 4,
+                length_prefix_scan_window: 64,
+                min_tlv_chain_len: 2,
+                max_tlv_chains: 5,
+                confidence_warn_threshold: 0.4,
+            },
+            Self::Aggressive => Tunables {
+                min_string_len: 3,
+                max_strings: 500,
+                string_group_gap: 64,
+                min_padding_size: 4,
+                min_record_count: 3,
+                length_prefix_scan_window: 128,
+                min_tlv_chain_len: 2,
+                max_tlv_chains: 10,
+                confidence_warn_threshold: 0.3,
+            },
+        }
+    }
+}
+
+/// Concrete thresholds applied to a single analysis run.
+///
+/// Built from a [`Sensitivity`] level via [`Sensitivity::tunables`]. Stored
+/// as plain fields rather than methods so the individual passes can read
+/// exactly what they need without crossing module boundaries.
+#[derive(Debug, Clone, Copy)]
+pub struct Tunables {
+    pub min_string_len: usize,
+    pub max_strings: usize,
+    pub string_group_gap: u64,
+    pub min_padding_size: usize,
+    pub min_record_count: usize,
+    pub length_prefix_scan_window: usize,
+    pub min_tlv_chain_len: usize,
+    pub max_tlv_chains: usize,
+    pub confidence_warn_threshold: f64,
+}
+
 /// Generic fallback analyzer that provides heuristic structural analysis
 /// for any binary file.
 ///
 /// Designed to run at the lowest confidence so that any dedicated analyzer
 /// always wins. Produces suggested structure, never authoritative parsing.
-pub struct GenericAnalyzer;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenericAnalyzer {
+    mode: Sensitivity,
+}
+
+impl GenericAnalyzer {
+    /// Create a generic analyzer with the default ([`Sensitivity::Balanced`]) mode.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a generic analyzer pinned to a specific sensitivity mode.
+    pub fn with_mode(mode: Sensitivity) -> Self {
+        Self { mode }
+    }
+
+    pub fn mode(&self) -> Sensitivity {
+        self.mode
+    }
+}
 
 impl Analyzer for GenericAnalyzer {
     fn id(&self) -> &'static str {
@@ -43,6 +146,7 @@ impl Analyzer for GenericAnalyzer {
         handle: &FileHandle,
         src: &dyn ByteSource,
     ) -> Result<AnalysisReport, AnalyzeError> {
+        let tunables = self.mode.tunables();
         let file_len = src.len();
         let read_len = file_len.min(MAX_ANALYSIS_SIZE);
         let data = src.read_range(ByteRange::new(0, read_len))?;
@@ -66,8 +170,11 @@ impl Analyzer for GenericAnalyzer {
 
         report_diagnostics.push(Diagnostic {
             severity: Severity::Info,
-            message: "Generic analysis produces suggested structure, not authoritative parsing."
-                .into(),
+            message: format!(
+                "Generic analysis produces suggested structure, not authoritative parsing \
+                 (sensitivity: {}).",
+                self.mode.label()
+            ),
             range: None,
         });
 
@@ -109,9 +216,10 @@ impl Analyzer for GenericAnalyzer {
         }
 
         // ── Pass 2: String extraction ──
-        let all_strings = strings::extract_strings(&data, 0);
+        let all_strings =
+            strings::extract_strings(&data, 0, tunables.min_string_len, tunables.max_strings);
         if !all_strings.is_empty() {
-            let groups = strings::group_strings(&all_strings, 32);
+            let groups = strings::group_strings(&all_strings, tunables.string_group_gap);
             let mut children = Vec::new();
 
             for (group_offset, group_length, indices) in &groups {
@@ -219,9 +327,10 @@ impl Analyzer for GenericAnalyzer {
         }
 
         // ── Pass 4: Chunk/record detection ──
-        let padding = chunks::detect_padding(&data, 0);
-        let records = chunks::detect_fixed_records(&data, 0);
-        let length_prefixed = chunks::detect_length_prefixed(&data, 0);
+        let padding = chunks::detect_padding(&data, 0, tunables.min_padding_size);
+        let records = chunks::detect_fixed_records(&data, 0, tunables.min_record_count);
+        let length_prefixed =
+            chunks::detect_length_prefixed(&data, 0, tunables.length_prefix_scan_window);
 
         let chunk_results: Vec<&chunks::DetectedChunk> = padding
             .iter()
@@ -261,7 +370,12 @@ impl Analyzer for GenericAnalyzer {
         }
 
         // ── Pass 5: TLV detection ──
-        let tlv_chains = tlv::detect_tlv_chains(&data, 0);
+        let tlv_chains = tlv::detect_tlv_chains(
+            &data,
+            0,
+            tunables.min_tlv_chain_len,
+            tunables.max_tlv_chains,
+        );
         if !tlv_chains.is_empty() {
             let mut children = Vec::new();
             for chain in &tlv_chains {
@@ -359,7 +473,7 @@ impl Analyzer for GenericAnalyzer {
         );
 
         report_diagnostics.push(Diagnostic {
-            severity: if conf.score > 0.4 {
+            severity: if conf.score > tunables.confidence_warn_threshold {
                 Severity::Info
             } else {
                 Severity::Warning
@@ -406,6 +520,11 @@ impl Analyzer for GenericAnalyzer {
             FieldView {
                 name: "Detected kind".into(),
                 value: handle.kind.to_string(),
+                range: None,
+            },
+            FieldView {
+                name: "Sensitivity".into(),
+                value: self.mode.label().into(),
                 range: None,
             },
             FieldView {
@@ -486,7 +605,7 @@ mod tests {
         let data = vec![0x00; 64];
         let src = MemoryByteSource::new(data.clone());
         let handle = make_handle(DetectedKind::Binary, data.len() as u64);
-        let analyzer = GenericAnalyzer;
+        let analyzer = GenericAnalyzer::new();
 
         assert_eq!(analyzer.can_analyze(&handle, &src), AnalyzerConfidence::Low);
 
@@ -508,7 +627,7 @@ mod tests {
         let src = MemoryByteSource::new(data.clone());
         let handle = make_handle(DetectedKind::Binary, data.len() as u64);
 
-        let report = GenericAnalyzer.analyze(&handle, &src).unwrap();
+        let report = GenericAnalyzer::new().analyze(&handle, &src).unwrap();
 
         // Should detect PNG signature.
         let sig_node = report.root_nodes.iter().find(|n| n.kind == "signatures");
@@ -527,7 +646,7 @@ mod tests {
         let src = MemoryByteSource::new(data.to_vec());
         let handle = make_handle(DetectedKind::Text, data.len() as u64);
 
-        let report = GenericAnalyzer.analyze(&handle, &src).unwrap();
+        let report = GenericAnalyzer::new().analyze(&handle, &src).unwrap();
 
         // Should find embedded strings.
         let str_node = report.root_nodes.iter().find(|n| n.kind == "strings");
@@ -540,7 +659,7 @@ mod tests {
         let src = MemoryByteSource::new(data.clone());
         let handle = make_handle(DetectedKind::Binary, data.len() as u64);
 
-        let report = GenericAnalyzer.analyze(&handle, &src).unwrap();
+        let report = GenericAnalyzer::new().analyze(&handle, &src).unwrap();
         assert!(
             report
                 .diagnostics
@@ -548,5 +667,103 @@ mod tests {
                 .any(|d| d.message.contains("confidence")),
             "should include confidence diagnostic"
         );
+    }
+
+    /// Build a small synthetic blob designed to expose differences between
+    /// sensitivity modes. The TLV chain must lead the buffer because the TLV
+    /// detector only parses from offset 0; the short string and short padding
+    /// region come after, separated by non-printable / non-padding bytes so
+    /// the runs stay isolated.
+    fn mixed_signal_blob() -> Vec<u8> {
+        let mut data = Vec::new();
+        // Two consecutive ASN.1 SEQUENCEs at offset 0 — Balanced/Aggressive
+        // (min_chain_len=2) accept; Conservative (min_chain_len=3) rejects.
+        data.extend_from_slice(&[0x30, 0x03, 0x02, 0x01, 0x2A]);
+        data.extend_from_slice(&[0x30, 0x03, 0x02, 0x01, 0x2B]);
+        // Non-printable, non-padding separator so the next run starts fresh.
+        data.push(0xFE);
+        // 3-char string — only Aggressive (min_string_len=3) accepts it.
+        data.extend_from_slice(b"abc");
+        data.push(0xFE);
+        // 5-byte zero padding — only Aggressive (min_padding_size=4) accepts it.
+        data.extend_from_slice(&[0x00; 5]);
+        data
+    }
+
+    fn count_kind(report: &AnalysisReport, kind: &str) -> usize {
+        report.root_nodes.iter().filter(|n| n.kind == kind).count()
+    }
+
+    #[test]
+    fn sensitivity_modes_produce_distinct_output() {
+        let data = mixed_signal_blob();
+        let src = MemoryByteSource::new(data.clone());
+        let handle = make_handle(DetectedKind::Binary, data.len() as u64);
+
+        let conservative = GenericAnalyzer::with_mode(Sensitivity::Conservative)
+            .analyze(&handle, &src)
+            .unwrap();
+        let balanced = GenericAnalyzer::with_mode(Sensitivity::Balanced)
+            .analyze(&handle, &src)
+            .unwrap();
+        let aggressive = GenericAnalyzer::with_mode(Sensitivity::Aggressive)
+            .analyze(&handle, &src)
+            .unwrap();
+
+        // Conservative rejects the 2-element TLV chain (min_tlv_chain_len=3),
+        // the 5-byte padding (min_padding_size=16), and the 3-char string
+        // (min_string_len=6).
+        assert_eq!(count_kind(&conservative, "tlv"), 0);
+        assert_eq!(count_kind(&conservative, "strings"), 0);
+
+        // Balanced accepts the 2-element chain but still rejects the short
+        // string and short padding.
+        assert_eq!(count_kind(&balanced, "tlv"), 1);
+        assert_eq!(count_kind(&balanced, "strings"), 0);
+
+        // Aggressive accepts everything: chain, short string, short padding.
+        assert_eq!(count_kind(&aggressive, "tlv"), 1);
+        assert_eq!(count_kind(&aggressive, "strings"), 1);
+        assert!(
+            count_kind(&aggressive, "chunks") >= 1,
+            "aggressive should pick up the 5-byte zero run as a chunk"
+        );
+    }
+
+    #[test]
+    fn sensitivity_mode_is_surfaced_in_overview_and_diagnostics() {
+        let data = vec![0x42; 64];
+        let src = MemoryByteSource::new(data.clone());
+        let handle = make_handle(DetectedKind::Binary, data.len() as u64);
+
+        let report = GenericAnalyzer::with_mode(Sensitivity::Aggressive)
+            .analyze(&handle, &src)
+            .unwrap();
+
+        let overview = report
+            .root_nodes
+            .iter()
+            .find(|n| n.kind == "overview")
+            .expect("overview node");
+        let mode_field = overview
+            .fields
+            .iter()
+            .find(|f| f.name == "Sensitivity")
+            .expect("Sensitivity field on overview");
+        assert_eq!(mode_field.value, "Aggressive");
+
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("sensitivity: Aggressive")),
+            "diagnostic line should name the active sensitivity"
+        );
+    }
+
+    #[test]
+    fn default_mode_is_balanced() {
+        assert_eq!(GenericAnalyzer::new().mode(), Sensitivity::Balanced);
+        assert_eq!(GenericAnalyzer::default().mode(), Sensitivity::Balanced);
     }
 }

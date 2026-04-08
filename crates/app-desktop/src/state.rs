@@ -393,7 +393,7 @@ impl AppState {
         registry.register(Box::new(tinkerspark_format_age::AgeAnalyzer));
         registry.register(Box::new(tinkerspark_format_jwk::JwkAnalyzer));
         // Generic fallback — always Low confidence, so dedicated analyzers win.
-        registry.register(Box::new(tinkerspark_format_generic::GenericAnalyzer));
+        registry.register(Box::new(tinkerspark_format_generic::GenericAnalyzer::new()));
 
         let session = tinkerspark_infra_session::load_session();
 

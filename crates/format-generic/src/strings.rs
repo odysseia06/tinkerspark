@@ -14,12 +14,6 @@ impl StringRegion {
     }
 }
 
-/// Minimum number of consecutive printable bytes to count as a string.
-const MIN_STRING_LEN: usize = 4;
-
-/// Maximum number of strings to extract (prevent noise on large files).
-const MAX_STRINGS: usize = 200;
-
 /// Maximum length of a single extracted string (truncate longer runs).
 const MAX_STRING_LEN: usize = 256;
 
@@ -29,8 +23,13 @@ fn is_printable(b: u8) -> bool {
 
 /// Extract runs of printable ASCII strings from the data.
 ///
-/// Returns up to `MAX_STRINGS` results, each at least `MIN_STRING_LEN` bytes.
-pub fn extract_strings(data: &[u8], base_offset: u64) -> Vec<StringRegion> {
+/// Returns up to `max_strings` results, each at least `min_string_len` bytes.
+pub fn extract_strings(
+    data: &[u8],
+    base_offset: u64,
+    min_string_len: usize,
+    max_strings: usize,
+) -> Vec<StringRegion> {
     let mut results = Vec::new();
     let mut run_start = None;
 
@@ -41,7 +40,7 @@ pub fn extract_strings(data: &[u8], base_offset: u64) -> Vec<StringRegion> {
             }
         } else if let Some(start) = run_start.take() {
             let len = i - start;
-            if len >= MIN_STRING_LEN {
+            if len >= min_string_len {
                 let display_len = len.min(MAX_STRING_LEN);
                 let content = String::from_utf8_lossy(&data[start..start + display_len]);
                 let mut content = content.into_owned();
@@ -53,7 +52,7 @@ pub fn extract_strings(data: &[u8], base_offset: u64) -> Vec<StringRegion> {
                     length: len as u64,
                     content,
                 });
-                if results.len() >= MAX_STRINGS {
+                if results.len() >= max_strings {
                     return results;
                 }
             }
@@ -63,7 +62,7 @@ pub fn extract_strings(data: &[u8], base_offset: u64) -> Vec<StringRegion> {
     // Handle trailing run.
     if let Some(start) = run_start {
         let len = data.len() - start;
-        if len >= MIN_STRING_LEN {
+        if len >= min_string_len {
             let display_len = len.min(MAX_STRING_LEN);
             let content = String::from_utf8_lossy(&data[start..start + display_len]);
             let mut content = content.into_owned();
@@ -116,7 +115,7 @@ mod tests {
     #[test]
     fn extracts_simple_strings() {
         let data = b"\x00\x00Hello World\x00\x00\x00test\x00";
-        let strings = extract_strings(data, 0);
+        let strings = extract_strings(data, 0, 4, 200);
         assert_eq!(strings.len(), 2);
         assert_eq!(strings[0].content, "Hello World");
         assert_eq!(strings[0].offset, 2);
@@ -126,7 +125,7 @@ mod tests {
     #[test]
     fn skips_short_runs() {
         let data = b"\x00ab\x00cdef\x00";
-        let strings = extract_strings(data, 0);
+        let strings = extract_strings(data, 0, 4, 200);
         assert_eq!(strings.len(), 1);
         assert_eq!(strings[0].content, "cdef");
     }
@@ -134,8 +133,17 @@ mod tests {
     #[test]
     fn respects_base_offset() {
         let data = b"Hello\x00";
-        let strings = extract_strings(data, 100);
+        let strings = extract_strings(data, 100, 4, 200);
         assert_eq!(strings[0].offset, 100);
+    }
+
+    #[test]
+    fn min_string_len_is_honored() {
+        let data = b"\x00ab\x00cdef\x00";
+        let strict = extract_strings(data, 0, 5, 200);
+        assert!(strict.is_empty(), "5-char threshold should reject 'cdef'");
+        let loose = extract_strings(data, 0, 2, 200);
+        assert_eq!(loose.len(), 2, "2-char threshold should accept 'ab'");
     }
 
     #[test]
