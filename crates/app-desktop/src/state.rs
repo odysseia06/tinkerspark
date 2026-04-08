@@ -423,8 +423,9 @@ impl AppState {
 
     /// Switch the generic-analyzer sensitivity, rebuild the registry to pick
     /// up the new mode, persist the choice into the in-memory session, and
-    /// re-run analysis on the active file so the change is visible without a
-    /// manual reload.
+    /// re-run analysis on every open file tab so cached reports stay coherent
+    /// with the live mode — not just the active tab. Diff tabs are skipped
+    /// because they hold no analyzer report.
     pub fn set_generic_sensitivity(&mut self, mode: Sensitivity) {
         if self.generic_sensitivity == mode {
             return;
@@ -432,10 +433,52 @@ impl AppState {
         self.generic_sensitivity = mode;
         self.registry = build_registry(mode);
         self.session.generic_sensitivity = Some(mode.label().to_string());
-        if matches!(self.active_tab(), Some(WorkspaceTab::File { .. })) {
-            self.reanalyze();
+        let refreshed = self.reanalyze_all_file_tabs();
+        self.status_message = Some(if refreshed == 0 {
+            format!("Generic analyzer sensitivity: {}", mode.label())
+        } else {
+            format!(
+                "Generic analyzer sensitivity: {} ({} tab{} reanalyzed)",
+                mode.label(),
+                refreshed,
+                if refreshed == 1 { "" } else { "s" }
+            )
+        });
+    }
+
+    /// Re-run analysis on every open file tab using the current registry,
+    /// reading through each tab's patch overlay so any pending edits are
+    /// included. Returns the number of file tabs whose analysis was
+    /// successfully refreshed. Diff tabs are left untouched.
+    pub fn reanalyze_all_file_tabs(&mut self) -> usize {
+        let mut refreshed = 0;
+        for tab in self.tabs.iter_mut() {
+            let WorkspaceTab::File { file, analysis } = tab else {
+                continue;
+            };
+            let patched =
+                tinkerspark_core_patch::PatchedView::new(&*file.source, file.patches.patches());
+            match self.registry.auto_analyze(&file.handle, &patched) {
+                Some(Ok(report)) => {
+                    let armored = has_decoded_ranges(&report);
+                    *analysis = Some(AnalysisState {
+                        report,
+                        stale: false,
+                        armored,
+                        selected_node: None,
+                        selected_range: None,
+                    });
+                    refreshed += 1;
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "bulk reanalysis failed for tab");
+                }
+                None => {
+                    *analysis = None;
+                }
+            }
         }
-        self.status_message = Some(format!("Generic analyzer sensitivity: {}", mode.label()));
+        refreshed
     }
 
     pub fn open(&mut self, path: &Path) {
@@ -646,18 +689,29 @@ mod tests {
     use tinkerspark_core_bytes::MemoryByteSource;
     use tinkerspark_core_types::{DetectedKind, FileId};
 
-    /// Push a synthetic in-memory file tab so we can exercise reanalysis
-    /// without touching disk.
-    fn push_synthetic_file(state: &mut AppState, data: Vec<u8>) {
+    fn synthetic_open_file(name: &str, data: Vec<u8>) -> OpenFile {
         let file_len = data.len() as u64;
         let handle = FileHandle {
             id: FileId::new(),
-            path: PathBuf::from("synthetic.bin"),
+            path: PathBuf::from(name),
             size: file_len,
             kind: DetectedKind::Binary,
         };
         let source: Box<dyn ByteSource> = Box::new(MemoryByteSource::new(data));
-        let analysis_result = state.registry.auto_analyze(&handle, &*source);
+        OpenFile {
+            handle,
+            source,
+            backend: BackendKind::Buffered,
+            hex: HexViewState::new(file_len),
+            patches: PatchHistory::new(file_len),
+        }
+    }
+
+    /// Push a synthetic in-memory file tab so we can exercise reanalysis
+    /// without touching disk.
+    fn push_synthetic_file(state: &mut AppState, data: Vec<u8>) {
+        let file = synthetic_open_file("synthetic.bin", data);
+        let analysis_result = state.registry.auto_analyze(&file.handle, &*file.source);
         let analysis = match analysis_result {
             Some(Ok(report)) => Some(AnalysisState {
                 report,
@@ -668,14 +722,28 @@ mod tests {
             }),
             _ => None,
         };
-        let file = OpenFile {
-            handle,
-            source,
-            backend: BackendKind::Buffered,
-            hex: HexViewState::new(file_len),
-            patches: PatchHistory::new(file_len),
-        };
         state.tabs.push(WorkspaceTab::File { file, analysis });
+        state.active_tab = state.tabs.len() - 1;
+    }
+
+    /// Push a synthetic diff tab built from two in-memory files.
+    fn push_synthetic_diff(state: &mut AppState, left_data: Vec<u8>, right_data: Vec<u8>) {
+        let left = synthetic_open_file("left.bin", left_data);
+        let right = synthetic_open_file("right.bin", right_data);
+        let config = tinkerspark_core_diff::DiffConfig::default();
+        let result =
+            tinkerspark_core_diff::compute_diff(&*left.source, &*right.source, &config).unwrap();
+        let navigator = DiffNavigator::new(&result);
+        state.tabs.push(WorkspaceTab::Diff(DiffSession {
+            left,
+            right,
+            result,
+            navigator,
+            sync_scroll: true,
+            scroll_authority: ScrollAuthority::Left,
+            last_merged_side: None,
+            merged_regions: Vec::new(),
+        }));
         state.active_tab = state.tabs.len() - 1;
     }
 
@@ -690,6 +758,14 @@ mod tests {
             .iter()
             .find(|f| f.name == "Sensitivity")
             .map(|f| f.value.clone())
+    }
+
+    fn overview_sensitivity_at(state: &mut AppState, tab_index: usize) -> Option<String> {
+        let saved = state.active_tab;
+        state.active_tab = tab_index;
+        let result = overview_sensitivity(state);
+        state.active_tab = saved;
+        result
     }
 
     #[test]
@@ -740,5 +816,67 @@ mod tests {
         state.set_generic_sensitivity(Sensitivity::Balanced);
         // No change → no status message bump from set_generic_sensitivity.
         assert_eq!(state.status_message, initial_status);
+    }
+
+    #[test]
+    fn switching_sensitivity_refreshes_every_open_file_tab() {
+        let mut state = AppState::with_session(SessionState::default());
+        push_synthetic_file(&mut state, vec![0x42; 64]); // tab 0
+        push_synthetic_file(&mut state, vec![0x37; 128]); // tab 1, currently active
+
+        // Both tabs start under the default Balanced mode.
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 0).as_deref(),
+            Some("Balanced")
+        );
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 1).as_deref(),
+            Some("Balanced")
+        );
+
+        // Mode change must refresh the inactive tab as well, otherwise its
+        // cached overview lies about the live setting.
+        state.set_generic_sensitivity(Sensitivity::Aggressive);
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 0).as_deref(),
+            Some("Aggressive"),
+            "inactive tab must also reflect the new sensitivity"
+        );
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 1).as_deref(),
+            Some("Aggressive")
+        );
+
+        // Neither refreshed analysis should be marked stale.
+        for tab in &state.tabs {
+            if let WorkspaceTab::File {
+                analysis: Some(a), ..
+            } = tab
+            {
+                assert!(!a.stale, "refreshed analysis must not be stale");
+            }
+        }
+    }
+
+    #[test]
+    fn switching_sensitivity_with_diff_active_still_refreshes_file_tabs() {
+        let mut state = AppState::with_session(SessionState::default());
+        push_synthetic_file(&mut state, vec![0x42; 64]); // tab 0
+        push_synthetic_diff(&mut state, vec![0x10; 16], vec![0x20; 16]); // tab 1, active
+
+        assert!(matches!(state.active_tab(), Some(WorkspaceTab::Diff(_))));
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 0).as_deref(),
+            Some("Balanced")
+        );
+
+        // Sensitivity change while a diff tab is active must still update the
+        // background file tab — global setting, global refresh.
+        state.set_generic_sensitivity(Sensitivity::Conservative);
+        assert_eq!(
+            overview_sensitivity_at(&mut state, 0).as_deref(),
+            Some("Conservative"),
+            "file tab behind a diff tab should still be refreshed"
+        );
     }
 }
