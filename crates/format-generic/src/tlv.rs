@@ -70,6 +70,10 @@ pub fn detect_tlv_chains(
     min_chain_len: usize,
     max_chains: usize,
 ) -> Vec<TlvChain> {
+    // A chain of zero elements is meaningless and would let try_parse_chain
+    // index an empty Vec on data that does not parse. Clamp at the boundary.
+    let min_chain_len = min_chain_len.max(1);
+
     let mut chains = Vec::new();
 
     // Try each encoding scheme.
@@ -290,5 +294,29 @@ mod tests {
         let data = &[0x00, 0x00, 0x00, 0x00];
         let chains = detect_tlv_chains(data, 0, 2, 5);
         assert!(chains.is_empty(), "should not find chains in null data");
+    }
+
+    #[test]
+    fn min_chain_len_zero_is_clamped_safely() {
+        // Empty data: caller passes 0 — must not panic via try_parse_chain
+        // indexing an empty Vec.
+        let chains = detect_tlv_chains(&[], 0, 0, 5);
+        assert!(chains.is_empty());
+
+        // Non-parsing data with min_chain_len 0 — same panic path on the
+        // original implementation.
+        let chains = detect_tlv_chains(&[0xFF, 0xFF, 0xFF, 0xFF], 0, 0, 5);
+        assert!(chains.is_empty());
+
+        // A real chain should still be reported when 0 is clamped to 1.
+        let data = &[
+            0x30, 0x03, 0x02, 0x01, 0x2A, // SEQUENCE { INTEGER 42 }
+            0x30, 0x03, 0x02, 0x01, 0x2B, // SEQUENCE { INTEGER 43 }
+        ];
+        let chains = detect_tlv_chains(data, 0, 0, 5);
+        assert!(
+            chains.iter().any(|c| c.encoding == TlvEncoding::Asn1Ber),
+            "0 should clamp to 1 and still find the real chain"
+        );
     }
 }

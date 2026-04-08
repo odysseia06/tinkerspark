@@ -30,6 +30,10 @@ pub fn extract_strings(
     min_string_len: usize,
     max_strings: usize,
 ) -> Vec<StringRegion> {
+    if max_strings == 0 {
+        return Vec::new();
+    }
+
     let mut results = Vec::new();
     let mut run_start = None;
 
@@ -62,7 +66,7 @@ pub fn extract_strings(
     // Handle trailing run.
     if let Some(start) = run_start {
         let len = data.len() - start;
-        if len >= min_string_len {
+        if len >= min_string_len && results.len() < max_strings {
             let display_len = len.min(MAX_STRING_LEN);
             let content = String::from_utf8_lossy(&data[start..start + display_len]);
             let mut content = content.into_owned();
@@ -144,6 +148,28 @@ mod tests {
         assert!(strict.is_empty(), "5-char threshold should reject 'cdef'");
         let loose = extract_strings(data, 0, 2, 200);
         assert_eq!(loose.len(), 2, "2-char threshold should accept 'ab'");
+    }
+
+    #[test]
+    fn max_strings_zero_returns_empty() {
+        let data = b"hello\x00world\x00trailing";
+        let strings = extract_strings(data, 0, 4, 0);
+        assert!(
+            strings.is_empty(),
+            "max_strings=0 must yield no results, not 1"
+        );
+    }
+
+    #[test]
+    fn max_strings_caps_inline_and_trailing_runs() {
+        // Two qualifying inline runs plus one trailing run that would push the
+        // count past the cap if the trailing branch ignored it.
+        let data = b"alpha\x00bravo\x00charlie";
+        let strings = extract_strings(data, 0, 4, 1);
+        assert_eq!(strings.len(), 1, "should stop at cap on inline branch");
+
+        let strings = extract_strings(data, 0, 4, 2);
+        assert_eq!(strings.len(), 2, "trailing branch must respect the cap too");
     }
 
     #[test]

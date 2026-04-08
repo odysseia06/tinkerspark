@@ -47,6 +47,22 @@ impl Sensitivity {
         }
     }
 
+    /// Parse a label produced by [`Sensitivity::label`] back into a variant.
+    /// Unknown labels fall back to [`Sensitivity::Balanced`] so persisted
+    /// session data from older builds remains forward-compatible.
+    pub fn from_label(s: &str) -> Self {
+        match s {
+            "Conservative" => Self::Conservative,
+            "Aggressive" => Self::Aggressive,
+            _ => Self::Balanced,
+        }
+    }
+
+    /// All sensitivity variants in display order. Useful for UI iteration.
+    pub fn all() -> [Self; 3] {
+        [Self::Conservative, Self::Balanced, Self::Aggressive]
+    }
+
     pub fn tunables(&self) -> Tunables {
         match self {
             Self::Conservative => Tunables {

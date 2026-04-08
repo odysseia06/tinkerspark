@@ -7,6 +7,7 @@ use tinkerspark_core_hexview::HexViewState;
 use tinkerspark_core_patch::PatchHistory;
 use tinkerspark_core_patch::PatchedView;
 use tinkerspark_core_types::{ByteRange, FileHandle, NodeId};
+use tinkerspark_format_generic::Sensitivity;
 use tinkerspark_infra_session::SessionState;
 
 /// The state of a single open file.
@@ -281,6 +282,8 @@ pub struct AppState {
     /// Index of the currently active tab.
     pub active_tab: usize,
     pub registry: AnalyzerRegistry,
+    /// Currently selected generic-analyzer sensitivity. Persisted in session.
+    pub generic_sensitivity: Sensitivity,
     pub session: SessionState,
     pub status_message: Option<String>,
     pub jump_to_input: String,
@@ -385,22 +388,24 @@ impl AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let mut registry = AnalyzerRegistry::new();
-        // Dedicated analyzers (highest confidence wins).
-        registry.register(Box::new(tinkerspark_format_openpgp::OpenPgpAnalyzer));
-        registry.register(Box::new(tinkerspark_format_x509::X509Analyzer));
-        registry.register(Box::new(tinkerspark_format_ssh::SshAnalyzer));
-        registry.register(Box::new(tinkerspark_format_age::AgeAnalyzer));
-        registry.register(Box::new(tinkerspark_format_jwk::JwkAnalyzer));
-        // Generic fallback — always Low confidence, so dedicated analyzers win.
-        registry.register(Box::new(tinkerspark_format_generic::GenericAnalyzer::new()));
+        Self::with_session(tinkerspark_infra_session::load_session())
+    }
 
-        let session = tinkerspark_infra_session::load_session();
+    /// Construct an AppState from an explicit SessionState. Used by `new()`
+    /// and by tests that need to skip disk IO.
+    pub fn with_session(session: SessionState) -> Self {
+        let generic_sensitivity = session
+            .generic_sensitivity
+            .as_deref()
+            .map(Sensitivity::from_label)
+            .unwrap_or_default();
+        let registry = build_registry(generic_sensitivity);
 
         Self {
             tabs: Vec::new(),
             active_tab: 0,
             registry,
+            generic_sensitivity,
             session,
             status_message: None,
             jump_to_input: String::new(),
@@ -414,6 +419,23 @@ impl AppState {
             command_query: String::new(),
             pending_close_tab: None,
         }
+    }
+
+    /// Switch the generic-analyzer sensitivity, rebuild the registry to pick
+    /// up the new mode, persist the choice into the in-memory session, and
+    /// re-run analysis on the active file so the change is visible without a
+    /// manual reload.
+    pub fn set_generic_sensitivity(&mut self, mode: Sensitivity) {
+        if self.generic_sensitivity == mode {
+            return;
+        }
+        self.generic_sensitivity = mode;
+        self.registry = build_registry(mode);
+        self.session.generic_sensitivity = Some(mode.label().to_string());
+        if matches!(self.active_tab(), Some(WorkspaceTab::File { .. })) {
+            self.reanalyze();
+        }
+        self.status_message = Some(format!("Generic analyzer sensitivity: {}", mode.label()));
     }
 
     pub fn open(&mut self, path: &Path) {
@@ -500,6 +522,7 @@ impl AppState {
         self.session.last_open_file = self.session.last_open_files.first().cloned();
         self.session.last_active_tab = self.active_tab;
         self.session.dock_layout = dock_layout;
+        self.session.generic_sensitivity = Some(self.generic_sensitivity.label().to_string());
         tinkerspark_infra_session::save_session(&self.session);
     }
 
@@ -587,6 +610,22 @@ fn ranges_overlap(a: &ByteRange, b: &ByteRange) -> bool {
     a.offset() < b.end() && b.offset() < a.end()
 }
 
+/// Build the analyzer registry with the given generic-fallback sensitivity.
+/// Dedicated analyzers always rank above the generic fallback by virtue of
+/// returning higher confidence levels.
+fn build_registry(generic_sensitivity: Sensitivity) -> AnalyzerRegistry {
+    let mut registry = AnalyzerRegistry::new();
+    registry.register(Box::new(tinkerspark_format_openpgp::OpenPgpAnalyzer));
+    registry.register(Box::new(tinkerspark_format_x509::X509Analyzer));
+    registry.register(Box::new(tinkerspark_format_ssh::SshAnalyzer));
+    registry.register(Box::new(tinkerspark_format_age::AgeAnalyzer));
+    registry.register(Box::new(tinkerspark_format_jwk::JwkAnalyzer));
+    registry.register(Box::new(
+        tinkerspark_format_generic::GenericAnalyzer::with_mode(generic_sensitivity),
+    ));
+    registry
+}
+
 fn open_as_openfile(path: &Path) -> Result<OpenFile, String> {
     let (source, handle, backend) =
         tinkerspark_core_bytes::open_file(path).map_err(|e| e.to_string())?;
@@ -598,4 +637,108 @@ fn open_as_openfile(path: &Path) -> Result<OpenFile, String> {
         hex: HexViewState::new(file_len),
         patches: PatchHistory::new(file_len),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tinkerspark_core_bytes::MemoryByteSource;
+    use tinkerspark_core_types::{DetectedKind, FileId};
+
+    /// Push a synthetic in-memory file tab so we can exercise reanalysis
+    /// without touching disk.
+    fn push_synthetic_file(state: &mut AppState, data: Vec<u8>) {
+        let file_len = data.len() as u64;
+        let handle = FileHandle {
+            id: FileId::new(),
+            path: PathBuf::from("synthetic.bin"),
+            size: file_len,
+            kind: DetectedKind::Binary,
+        };
+        let source: Box<dyn ByteSource> = Box::new(MemoryByteSource::new(data));
+        let analysis_result = state.registry.auto_analyze(&handle, &*source);
+        let analysis = match analysis_result {
+            Some(Ok(report)) => Some(AnalysisState {
+                report,
+                stale: false,
+                armored: false,
+                selected_node: None,
+                selected_range: None,
+            }),
+            _ => None,
+        };
+        let file = OpenFile {
+            handle,
+            source,
+            backend: BackendKind::Buffered,
+            hex: HexViewState::new(file_len),
+            patches: PatchHistory::new(file_len),
+        };
+        state.tabs.push(WorkspaceTab::File { file, analysis });
+        state.active_tab = state.tabs.len() - 1;
+    }
+
+    fn overview_sensitivity(state: &AppState) -> Option<String> {
+        state
+            .active_analysis()?
+            .report
+            .root_nodes
+            .iter()
+            .find(|n| n.kind == "overview")?
+            .fields
+            .iter()
+            .find(|f| f.name == "Sensitivity")
+            .map(|f| f.value.clone())
+    }
+
+    #[test]
+    fn session_round_trip_restores_sensitivity() {
+        let mut session = SessionState::default();
+        session.generic_sensitivity = Some("Aggressive".into());
+        let state = AppState::with_session(session);
+        assert_eq!(state.generic_sensitivity, Sensitivity::Aggressive);
+    }
+
+    #[test]
+    fn missing_session_field_defaults_to_balanced() {
+        let state = AppState::with_session(SessionState::default());
+        assert_eq!(state.generic_sensitivity, Sensitivity::Balanced);
+    }
+
+    #[test]
+    fn switching_sensitivity_reanalyzes_active_file_and_updates_overview() {
+        let mut state = AppState::with_session(SessionState::default());
+        // Start with a known mode that produces an overview field of "Balanced".
+        push_synthetic_file(&mut state, vec![0x42; 64]);
+        assert_eq!(overview_sensitivity(&state).as_deref(), Some("Balanced"));
+
+        // Switching modes must rebuild the registry, rerun analysis, and the
+        // new mode must show up in the overview field surfaced by the analyzer.
+        state.set_generic_sensitivity(Sensitivity::Aggressive);
+        assert_eq!(state.generic_sensitivity, Sensitivity::Aggressive);
+        assert_eq!(overview_sensitivity(&state).as_deref(), Some("Aggressive"));
+
+        state.set_generic_sensitivity(Sensitivity::Conservative);
+        assert_eq!(
+            overview_sensitivity(&state).as_deref(),
+            Some("Conservative")
+        );
+
+        // The session mirror must follow the live state so on_exit persists it.
+        assert_eq!(
+            state.session.generic_sensitivity.as_deref(),
+            Some("Conservative")
+        );
+    }
+
+    #[test]
+    fn setting_same_sensitivity_is_a_noop() {
+        let mut state = AppState::with_session(SessionState::default());
+        push_synthetic_file(&mut state, vec![0x42; 64]);
+        let initial_status = state.status_message.clone();
+        state.set_generic_sensitivity(Sensitivity::Balanced);
+        // No change → no status message bump from set_generic_sensitivity.
+        assert_eq!(state.status_message, initial_status);
+    }
 }

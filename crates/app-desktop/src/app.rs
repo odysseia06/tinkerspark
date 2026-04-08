@@ -355,6 +355,23 @@ impl eframe::App for TinkersparkApp {
                         ui.close_menu();
                     }
                     ui.separator();
+                    let current_mode = self.state.generic_sensitivity;
+                    ui.menu_button(
+                        format!("Generic Sensitivity: {}", current_mode.label()),
+                        |ui| {
+                            for mode in tinkerspark_format_generic::Sensitivity::all() {
+                                let selected = mode == current_mode;
+                                if ui
+                                    .add(egui::SelectableLabel::new(selected, mode.label()))
+                                    .clicked()
+                                {
+                                    self.state.set_generic_sensitivity(mode);
+                                    ui.close_menu();
+                                }
+                            }
+                        },
+                    );
+                    ui.separator();
                     let is_dark = ctx.style().visuals.dark_mode;
                     if ui
                         .button(if is_dark { "Light Theme" } else { "Dark Theme" })

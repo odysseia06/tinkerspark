@@ -56,6 +56,11 @@ pub struct SessionState {
     /// Stored as a raw Value to decouple infra-session from egui_dock types.
     #[serde(default)]
     pub dock_layout: Option<serde_json::Value>,
+    /// Generic-analyzer sensitivity mode label, e.g. "Conservative",
+    /// "Balanced", "Aggressive". Stored as a string so this crate stays
+    /// independent of the format-generic type.
+    #[serde(default)]
+    pub generic_sensitivity: Option<String>,
 }
 
 impl SessionState {
