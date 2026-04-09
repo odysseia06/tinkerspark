@@ -1,0 +1,12 @@
+# Tinkerspark test fixture: authorized_keys
+# Plain entry, no options
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl alice@example.com
+
+# Entry with options
+no-port-forwarding,from="10.0.0.1" ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDdXHjfake== bob@example.com
+
+# Entry with options containing spaces inside quotes
+command="echo hello world",no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBfakeKeyDataXXXXXXXXXXXXXXXXXXXXXXXXX carol@example.com
+
+# Trailing malformed line (key type missing)
+not-a-real-algorithm AAAAfake malformed@example.com

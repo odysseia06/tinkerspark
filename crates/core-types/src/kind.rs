@@ -21,6 +21,13 @@ pub enum DetectedKind {
     SshPrivateKey,
     /// SSH public key (detected by "ssh-rsa ", "ssh-ed25519 ", etc.).
     SshPublicKey,
+    /// OpenSSH `authorized_keys` file (multi-line public keys with optional
+    /// per-line options). Detected by canonical filename or by content
+    /// containing multiple SSH public-key lines.
+    SshAuthorizedKeys,
+    /// OpenSSH `known_hosts` file. Detected by canonical filename or by
+    /// content containing host-pattern + key-type entries.
+    SshKnownHosts,
 
     /// age-encrypted file (detected by "age-encryption.org/" header).
     AgeEncrypted,
@@ -53,6 +60,8 @@ impl fmt::Display for DetectedKind {
             Self::X509Der => write!(f, "X.509 (DER)"),
             Self::SshPrivateKey => write!(f, "SSH private key"),
             Self::SshPublicKey => write!(f, "SSH public key"),
+            Self::SshAuthorizedKeys => write!(f, "SSH authorized_keys"),
+            Self::SshKnownHosts => write!(f, "SSH known_hosts"),
             Self::AgeEncrypted => write!(f, "age (encrypted)"),
             Self::AgeKey => write!(f, "age (key)"),
             Self::JsonWebToken => write!(f, "JWT"),

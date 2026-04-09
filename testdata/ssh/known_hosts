@@ -1,0 +1,12 @@
+# Tinkerspark test fixture: known_hosts
+# Plain hostname entry
+github.com,140.82.114.4 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+
+# Hashed host entry
+|1|F1E1f8gPzg5VrIWJzNCJjQjFKBQ=|N4i7zd0EIuTakvAlk5gIVtPP4lk= ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDfakeRSAhostkey== rsa-host
+
+# Marker entry (CA)
+@cert-authority *.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl ca
+
+# Malformed line — unknown key type
+example.org bogus-algo AAAAfake comment

@@ -352,6 +352,194 @@ fn parses_ecdsa_private_key_fields() {
     }
 }
 
+// ── authorized_keys (issue #4) ──
+
+#[test]
+fn parses_authorized_keys_fixture() {
+    let data = std::fs::read("../../testdata/ssh/authorized_keys").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::SshAuthorizedKeys, data.len() as u64);
+
+    let analyzer = tinkerspark_format_ssh::SshAnalyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+    let root = &report.root_nodes[0];
+    assert_eq!(root.kind, "ssh_authorized_keys");
+    assert_eq!(root.range.offset(), 0);
+    assert_eq!(root.range.length(), data.len() as u64);
+
+    // Three well-formed entries (the malformed one becomes a diagnostic).
+    assert_eq!(
+        root.children.len(),
+        3,
+        "expected 3 entries; got: {:?}",
+        root.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+    for entry in &root.children {
+        assert_eq!(entry.kind, "ssh_authorized_key_entry");
+        assert!(!entry.range.is_empty());
+        assert!(entry.fields.iter().any(|f| f.name == "Key Type"));
+        assert!(entry.fields.iter().any(|f| f.name == "Key Data (base64)"));
+    }
+
+    // Entry 0: plain ed25519, no options.
+    let alice = &root.children[0];
+    assert!(alice
+        .fields
+        .iter()
+        .any(|f| f.name == "Key Type" && f.value == "ssh-ed25519"));
+    assert!(!alice.fields.iter().any(|f| f.name == "Options"));
+    assert!(alice
+        .fields
+        .iter()
+        .any(|f| f.name == "Comment" && f.value == "alice@example.com"));
+
+    // Entry 1: ssh-rsa with options.
+    let bob = &root.children[1];
+    let bob_options = bob.fields.iter().find(|f| f.name == "Options").unwrap();
+    assert!(bob_options.value.contains("no-port-forwarding"));
+    assert!(bob_options.value.contains("from=\"10.0.0.1\""));
+    assert!(bob
+        .fields
+        .iter()
+        .any(|f| f.name == "Key Type" && f.value == "ssh-rsa"));
+
+    // Entry 2: options containing a quoted space (`command="echo hello world"`)
+    // — exercises the quote-aware options-end finder.
+    let carol = &root.children[2];
+    let carol_opts = carol.fields.iter().find(|f| f.name == "Options").unwrap();
+    assert!(
+        carol_opts.value.contains("echo hello world"),
+        "options should preserve the full quoted string; got: {:?}",
+        carol_opts.value
+    );
+    assert!(carol
+        .fields
+        .iter()
+        .any(|f| f.name == "Key Type" && f.value == "ssh-ed25519"));
+
+    // Sibling entries must have distinct byte ranges.
+    let mut offsets: Vec<u64> = root.children.iter().map(|c| c.range.offset()).collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    assert_eq!(offsets.len(), root.children.len());
+
+    // The malformed line should produce a diagnostic, not crash the parse.
+    assert!(
+        root.diagnostics
+            .iter()
+            .any(|d| d.message.contains("not-a-real-algorithm")
+                || d.message.contains("unrecognized")
+                || d.message.contains("authorized_keys")),
+        "expected a diagnostic for the malformed entry; got: {:?}",
+        root.diagnostics
+    );
+}
+
+// ── known_hosts (issue #4) ──
+
+#[test]
+fn parses_known_hosts_fixture() {
+    let data = std::fs::read("../../testdata/ssh/known_hosts").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::SshKnownHosts, data.len() as u64);
+
+    let analyzer = tinkerspark_format_ssh::SshAnalyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+    let root = &report.root_nodes[0];
+    assert_eq!(root.kind, "ssh_known_hosts");
+    assert_eq!(root.range.offset(), 0);
+    assert_eq!(root.range.length(), data.len() as u64);
+
+    // Three well-formed entries (the malformed one becomes a diagnostic).
+    assert_eq!(
+        root.children.len(),
+        3,
+        "expected 3 entries; got: {:?}",
+        root.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+    for entry in &root.children {
+        assert_eq!(entry.kind, "ssh_known_host_entry");
+        assert!(!entry.range.is_empty());
+        assert!(entry.fields.iter().any(|f| f.name == "Hostnames"));
+        assert!(entry.fields.iter().any(|f| f.name == "Key Type"));
+        assert!(entry.fields.iter().any(|f| f.name == "Hashed"));
+    }
+
+    // Entry 0: github.com plain.
+    let github = &root.children[0];
+    assert!(github
+        .fields
+        .iter()
+        .any(|f| f.name == "Hostnames" && f.value.contains("github.com")));
+    assert!(github
+        .fields
+        .iter()
+        .any(|f| f.name == "Hashed" && f.value == "No"));
+    assert!(github
+        .fields
+        .iter()
+        .any(|f| f.name == "Key Type" && f.value == "ssh-ed25519"));
+
+    // Entry 1: hashed.
+    let hashed = &root.children[1];
+    assert!(hashed
+        .fields
+        .iter()
+        .any(|f| f.name == "Hashed" && f.value == "Yes"));
+    let host_field = hashed
+        .fields
+        .iter()
+        .find(|f| f.name == "Hostnames")
+        .unwrap();
+    assert_eq!(host_field.value, "<hashed host>");
+    assert!(hashed
+        .fields
+        .iter()
+        .any(|f| f.name == "Key Type" && f.value == "ssh-rsa"));
+
+    // Entry 2: marker @cert-authority.
+    let ca = &root.children[2];
+    assert!(ca
+        .fields
+        .iter()
+        .any(|f| f.name == "Marker" && f.value == "@cert-authority"));
+    assert!(ca
+        .fields
+        .iter()
+        .any(|f| f.name == "Hostnames" && f.value.contains("*.example.com")));
+
+    // Sibling entries must have distinct byte ranges.
+    let mut offsets: Vec<u64> = root.children.iter().map(|c| c.range.offset()).collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    assert_eq!(offsets.len(), root.children.len());
+
+    // Malformed line should produce a diagnostic.
+    assert!(
+        root.diagnostics
+            .iter()
+            .any(|d| d.message.contains("bogus-algo") || d.message.contains("unrecognized")),
+        "expected a diagnostic for the malformed entry; got: {:?}",
+        root.diagnostics
+    );
+}
+
+#[test]
+fn analyzer_claims_authorized_keys_and_known_hosts_kinds() {
+    let analyzer = tinkerspark_format_ssh::SshAnalyzer;
+    let src = MemoryByteSource::new(vec![0]);
+    let auth_handle = make_handle(DetectedKind::SshAuthorizedKeys, 1);
+    let known_handle = make_handle(DetectedKind::SshKnownHosts, 1);
+    assert_eq!(
+        analyzer.can_analyze(&auth_handle, &src),
+        AnalyzerConfidence::High
+    );
+    assert_eq!(
+        analyzer.can_analyze(&known_handle, &src),
+        AnalyzerConfidence::High
+    );
+}
+
 // ── Public key fixture ──
 
 #[test]

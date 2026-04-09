@@ -21,8 +21,10 @@ impl Analyzer for SshAnalyzer {
 
     fn can_analyze(&self, handle: &FileHandle, _src: &dyn ByteSource) -> AnalyzerConfidence {
         match &handle.kind {
-            DetectedKind::SshPrivateKey => AnalyzerConfidence::High,
-            DetectedKind::SshPublicKey => AnalyzerConfidence::High,
+            DetectedKind::SshPrivateKey
+            | DetectedKind::SshPublicKey
+            | DetectedKind::SshAuthorizedKeys
+            | DetectedKind::SshKnownHosts => AnalyzerConfidence::High,
             _ => AnalyzerConfidence::None,
         }
     }
@@ -54,6 +56,26 @@ impl Analyzer for SshAnalyzer {
                     root_nodes.push(node);
                     diagnostics.append(&mut diags);
                 }
+                Err(msg) => {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: msg,
+                        range: Some(ByteRange::new(0, file_len)),
+                    });
+                }
+            },
+            DetectedKind::SshAuthorizedKeys => match parse_authorized_keys(&data) {
+                Ok(node) => root_nodes.push(node),
+                Err(msg) => {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        message: msg,
+                        range: Some(ByteRange::new(0, file_len)),
+                    });
+                }
+            },
+            DetectedKind::SshKnownHosts => match parse_known_hosts(&data) {
+                Ok(node) => root_nodes.push(node),
                 Err(msg) => {
                     diagnostics.push(Diagnostic {
                         severity: Severity::Error,
@@ -149,6 +171,375 @@ fn parse_public_key_line(raw: &[u8]) -> Result<AnalysisNode, String> {
         children: Vec::new(),
         fields,
         diagnostics: key_diagnostics,
+    })
+}
+
+// ── authorized_keys / known_hosts parsing ───────────────────────────────
+
+/// Walk a byte buffer line-by-line, returning `(file_offset, line_length,
+/// line_text)` for each line whose contents are valid UTF-8. Skips the
+/// trailing `\r` of CRLF endings. Empty lines are still emitted (the caller
+/// can choose to skip them) so the offsets stay accurate.
+fn iter_lines_with_offsets(data: &[u8]) -> Vec<(u64, u64, &str)> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    while start < data.len() {
+        let mut end = start;
+        while end < data.len() && data[end] != b'\n' {
+            end += 1;
+        }
+        let mut content_end = end;
+        if content_end > start && data[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        if let Ok(line) = std::str::from_utf8(&data[start..content_end]) {
+            lines.push((start as u64, (content_end - start) as u64, line));
+        }
+        start = if end < data.len() { end + 1 } else { end };
+    }
+    lines
+}
+
+/// Build a byte range for a substring `sub` known to live inside the
+/// `(line_start, line_text)` slice currently being parsed.
+fn sub_range(line_start: u64, line_text: &str, sub: &str) -> Option<ByteRange> {
+    let parent = line_text.as_ptr() as usize;
+    let child = sub.as_ptr() as usize;
+    if child < parent {
+        return None;
+    }
+    let offset = child - parent;
+    if offset + sub.len() > line_text.len() {
+        return None;
+    }
+    ByteRange::try_new(line_start + offset as u64, sub.len() as u64)
+}
+
+/// Parse an OpenSSH `authorized_keys` file.
+///
+/// Each non-comment line carries an optional whitespace-separated options
+/// prefix (e.g. `no-port-forwarding,from="10.0.0.1"`), followed by a key
+/// type token, the base64 key blob, and an optional free-form comment.
+fn parse_authorized_keys(data: &[u8]) -> Result<AnalysisNode, String> {
+    let lines = iter_lines_with_offsets(data);
+    let mut entries = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut entry_index = 0usize;
+
+    for (line_start, line_len, raw_line) in lines {
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match parse_authorized_keys_line(line_start, raw_line, line, entry_index) {
+            Ok(node) => {
+                entries.push(node);
+                entry_index += 1;
+            }
+            Err(msg) => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    message: msg,
+                    range: Some(ByteRange::new(line_start, line_len)),
+                });
+            }
+        }
+    }
+
+    if entries.is_empty() && diagnostics.is_empty() {
+        return Err("No SSH key entries found in authorized_keys file".into());
+    }
+
+    Ok(AnalysisNode {
+        id: NodeId::new(),
+        label: format!("authorized_keys ({} entries)", entries.len()),
+        kind: "ssh_authorized_keys".into(),
+        range: ByteRange::new(0, data.len() as u64),
+        children: entries,
+        fields: Vec::new(),
+        diagnostics,
+    })
+}
+
+fn parse_authorized_keys_line(
+    line_start: u64,
+    raw_line: &str,
+    trimmed: &str,
+    entry_index: usize,
+) -> Result<AnalysisNode, String> {
+    // Locate the key type token. Walk whitespace-separated tokens until
+    // one matches a known SSH algorithm; everything before it is the
+    // optional options string.
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens
+        .next()
+        .ok_or_else(|| "empty authorized_keys entry".to_string())?;
+
+    let (options, key_type, blob, comment) = if tinkerspark_core_bytes::is_ssh_key_type(first) {
+        let blob = tokens
+            .next()
+            .ok_or_else(|| "missing key blob in authorized_keys entry".to_string())?;
+        let comment = remainder_after(trimmed, blob);
+        (None, first, blob, comment)
+    } else {
+        // Options prefix is the substring up to the first whitespace
+        // that *isn't* inside double-quotes.
+        let opts_end = find_options_end(trimmed)
+            .ok_or_else(|| "could not locate end of options prefix".to_string())?;
+        let opts = &trimmed[..opts_end];
+        let rest = trimmed[opts_end..].trim_start();
+        let mut rest_tokens = rest.split_whitespace();
+        let key_type = rest_tokens
+            .next()
+            .ok_or_else(|| "missing key type after options".to_string())?;
+        if !tinkerspark_core_bytes::is_ssh_key_type(key_type) {
+            return Err(format!(
+                "unrecognized SSH key type after options: {}",
+                key_type
+            ));
+        }
+        let blob = rest_tokens
+            .next()
+            .ok_or_else(|| "missing key blob after options".to_string())?;
+        let comment = remainder_after(rest, blob);
+        (Some(opts), key_type, blob, comment)
+    };
+
+    let mut fields = Vec::new();
+    if let Some(opts) = options {
+        fields.push(FieldView {
+            name: "Options".into(),
+            value: opts.to_string(),
+            range: sub_range(line_start, raw_line, opts),
+        });
+    }
+    fields.push(FieldView {
+        name: "Key Type".into(),
+        value: key_type.to_string(),
+        range: sub_range(line_start, raw_line, key_type),
+    });
+    fields.push(FieldView {
+        name: "Key Data (base64)".into(),
+        value: format!("{} chars", blob.len()),
+        range: sub_range(line_start, raw_line, blob),
+    });
+    if let Some(c) = comment {
+        if !c.is_empty() {
+            fields.push(FieldView {
+                name: "Comment".into(),
+                value: c.to_string(),
+                range: sub_range(line_start, raw_line, c),
+            });
+        }
+    }
+
+    // Best-effort fingerprint via the ssh-key crate. The crate accepts the
+    // wire form `key-type base64 [comment]` but not options-prefixed lines,
+    // so we feed it the canonical suffix.
+    let canonical = match comment.filter(|c| !c.is_empty()) {
+        Some(c) => format!("{} {} {}", key_type, blob, c),
+        None => format!("{} {}", key_type, blob),
+    };
+    if let Ok(pk) = ssh_key::PublicKey::from_openssh(&canonical) {
+        fields.push(FieldView {
+            name: "Fingerprint (SHA-256)".into(),
+            value: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+            range: None,
+        });
+    }
+
+    let label = match comment.filter(|c| !c.is_empty()) {
+        Some(c) => format!("Entry {}: {} ({})", entry_index, key_type, c),
+        None => format!("Entry {}: {}", entry_index, key_type),
+    };
+    Ok(AnalysisNode {
+        id: NodeId::new(),
+        label,
+        kind: "ssh_authorized_key_entry".into(),
+        range: ByteRange::new(line_start, raw_line.len() as u64),
+        children: Vec::new(),
+        fields,
+        diagnostics: Vec::new(),
+    })
+}
+
+/// Find the byte index in `line` where an options prefix ends. The options
+/// field is terminated by the first whitespace character that is not inside
+/// a double-quoted region. Returns `None` if no such whitespace is found.
+fn find_options_end(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            in_quotes = !in_quotes;
+        } else if !in_quotes && (b == b' ' || b == b'\t') {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Return the substring of `line` that comes after `token`, trimmed of
+/// leading whitespace. Returns `None` if `token` doesn't fit inside `line`.
+fn remainder_after<'a>(line: &'a str, token: &str) -> Option<&'a str> {
+    let line_ptr = line.as_ptr() as usize;
+    let tok_ptr = token.as_ptr() as usize;
+    if tok_ptr < line_ptr {
+        return None;
+    }
+    let offset = tok_ptr - line_ptr;
+    let after = offset + token.len();
+    if after > line.len() {
+        return None;
+    }
+    Some(line[after..].trim_start())
+}
+
+/// Parse an OpenSSH `known_hosts` file.
+///
+/// Each non-comment line is `[marker ]hostnames key-type base64 [comment]`,
+/// where `marker` is optionally `@cert-authority` or `@revoked`, and
+/// `hostnames` is either a comma-separated list or a hashed `|1|salt|hash`
+/// token.
+fn parse_known_hosts(data: &[u8]) -> Result<AnalysisNode, String> {
+    let lines = iter_lines_with_offsets(data);
+    let mut entries = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut entry_index = 0usize;
+
+    for (line_start, line_len, raw_line) in lines {
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match parse_known_hosts_line(line_start, raw_line, line, entry_index) {
+            Ok(node) => {
+                entries.push(node);
+                entry_index += 1;
+            }
+            Err(msg) => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    message: msg,
+                    range: Some(ByteRange::new(line_start, line_len)),
+                });
+            }
+        }
+    }
+
+    if entries.is_empty() && diagnostics.is_empty() {
+        return Err("No SSH host entries found in known_hosts file".into());
+    }
+
+    Ok(AnalysisNode {
+        id: NodeId::new(),
+        label: format!("known_hosts ({} entries)", entries.len()),
+        kind: "ssh_known_hosts".into(),
+        range: ByteRange::new(0, data.len() as u64),
+        children: entries,
+        fields: Vec::new(),
+        diagnostics,
+    })
+}
+
+fn parse_known_hosts_line(
+    line_start: u64,
+    raw_line: &str,
+    trimmed: &str,
+    entry_index: usize,
+) -> Result<AnalysisNode, String> {
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens
+        .next()
+        .ok_or_else(|| "empty known_hosts entry".to_string())?;
+    let (marker, hostnames) = if first == "@cert-authority" || first == "@revoked" {
+        let host = tokens
+            .next()
+            .ok_or_else(|| "marker without hostnames".to_string())?;
+        (Some(first), host)
+    } else {
+        (None, first)
+    };
+    let key_type = tokens
+        .next()
+        .ok_or_else(|| "missing key type in known_hosts entry".to_string())?;
+    if !tinkerspark_core_bytes::is_ssh_key_type(key_type) {
+        return Err(format!("unrecognized SSH key type: {}", key_type));
+    }
+    let blob = tokens
+        .next()
+        .ok_or_else(|| "missing key blob in known_hosts entry".to_string())?;
+    let comment = remainder_after(trimmed, blob);
+
+    let hashed = hostnames.starts_with("|1|");
+    let host_display = if hashed {
+        "<hashed host>".to_string()
+    } else {
+        hostnames.to_string()
+    };
+
+    let mut fields = Vec::new();
+    if let Some(m) = marker {
+        fields.push(FieldView {
+            name: "Marker".into(),
+            value: m.to_string(),
+            range: sub_range(line_start, raw_line, m),
+        });
+    }
+    fields.push(FieldView {
+        name: "Hostnames".into(),
+        value: host_display.clone(),
+        range: sub_range(line_start, raw_line, hostnames),
+    });
+    fields.push(FieldView {
+        name: "Hashed".into(),
+        value: if hashed { "Yes" } else { "No" }.into(),
+        range: None,
+    });
+    fields.push(FieldView {
+        name: "Key Type".into(),
+        value: key_type.to_string(),
+        range: sub_range(line_start, raw_line, key_type),
+    });
+    fields.push(FieldView {
+        name: "Key Data (base64)".into(),
+        value: format!("{} chars", blob.len()),
+        range: sub_range(line_start, raw_line, blob),
+    });
+    if let Some(c) = comment {
+        if !c.is_empty() {
+            fields.push(FieldView {
+                name: "Comment".into(),
+                value: c.to_string(),
+                range: sub_range(line_start, raw_line, c),
+            });
+        }
+    }
+
+    // Best-effort fingerprint via ssh-key, using the canonical wire form.
+    let canonical = match comment.filter(|c| !c.is_empty()) {
+        Some(c) => format!("{} {} {}", key_type, blob, c),
+        None => format!("{} {}", key_type, blob),
+    };
+    if let Ok(pk) = ssh_key::PublicKey::from_openssh(&canonical) {
+        fields.push(FieldView {
+            name: "Fingerprint (SHA-256)".into(),
+            value: pk.fingerprint(ssh_key::HashAlg::Sha256).to_string(),
+            range: None,
+        });
+    }
+
+    Ok(AnalysisNode {
+        id: NodeId::new(),
+        label: format!("Entry {}: {} ({})", entry_index, host_display, key_type),
+        kind: "ssh_known_host_entry".into(),
+        range: ByteRange::new(line_start, raw_line.len() as u64),
+        children: Vec::new(),
+        fields,
+        diagnostics: Vec::new(),
     })
 }
 

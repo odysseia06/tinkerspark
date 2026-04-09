@@ -107,6 +107,136 @@ fn is_openpgp_extension(path: &Path) -> bool {
     )
 }
 
+/// Canonical OpenSSH filenames for `authorized_keys` (and the historical
+/// `authorized_keys2`). Used as the primary signal for sniffing — content
+/// detection is secondary because the file body looks the same as a
+/// stand-alone public key when it has only one entry.
+fn is_authorized_keys_filename(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("authorized_keys") | Some("authorized_keys2")
+    )
+}
+
+/// Canonical OpenSSH filenames for `known_hosts`.
+fn is_known_hosts_filename(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("known_hosts") | Some("known_hosts2")
+    )
+}
+
+/// Content-based heuristic for `known_hosts`. Requires at least two
+/// non-comment lines whose **first** token (after an optional `@cert-authority`
+/// / `@revoked` marker) looks like a host pattern (not an authorized_keys
+/// option) and whose **next** token is a known SSH key type.
+fn looks_like_known_hosts(header: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(header) else {
+        return false;
+    };
+    let mut entry_lines = 0usize;
+    for line in text.lines().take(16) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let first = tokens.next().unwrap_or("");
+        let host = if first == "@cert-authority" || first == "@revoked" {
+            tokens.next().unwrap_or("")
+        } else {
+            first
+        };
+        if host.is_empty() {
+            return false;
+        }
+        // Hashed hosts (`|1|salt|hash`) carry `=` as base64 padding so the
+        // option-rejection rule below would false-negative them. Accept the
+        // `|1|` prefix explicitly; for plain hosts, reject option-shaped
+        // first tokens (containing `=` or `"`).
+        if !host.starts_with("|1|") && (host.contains('=') || host.contains('"')) {
+            return false;
+        }
+        let key_type = tokens.next().unwrap_or("");
+        if !is_ssh_key_type(key_type) {
+            return false;
+        }
+        entry_lines += 1;
+        if entry_lines >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Content-based heuristic for `authorized_keys`. Requires at least two
+/// non-comment lines whose **first** token is either a known SSH key type
+/// (no options prefix) or an options-shaped string (contains `=` or `"`)
+/// followed immediately by a key type token.
+fn looks_like_authorized_keys(header: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(header) else {
+        return false;
+    };
+    let mut key_lines = 0usize;
+    for line in text.lines().take(16) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let first = match tokens.next() {
+            Some(t) => t,
+            None => return false,
+        };
+        // Hashed known_hosts host tokens (`|1|salt|hash`) contain `=` as
+        // base64 padding, so an options-shaped check on `=` alone would
+        // false-match them. Reject the `|` prefix explicitly.
+        if first.starts_with('|') {
+            return false;
+        }
+        let valid = if is_ssh_key_type(first) {
+            // Bare `ssh-rsa AAAA…` line.
+            true
+        } else if first.contains('=') || first.contains('"') {
+            // Options prefix → next token must be a key type.
+            tokens.next().map(is_ssh_key_type).unwrap_or(false)
+        } else {
+            // Anything else (hostnames, prose) is not an authorized_keys line.
+            false
+        };
+        if !valid {
+            return false;
+        }
+        key_lines += 1;
+        if key_lines >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recognize the canonical OpenSSH public-key algorithm tokens that appear
+/// at the start of an authorized_keys / known_hosts entry's key field.
+pub fn is_ssh_key_type(token: &str) -> bool {
+    matches!(
+        token,
+        "ssh-rsa"
+            | "ssh-dss"
+            | "ssh-ed25519"
+            | "ssh-ed448"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+            | "ssh-rsa-cert-v01@openssh.com"
+            | "ssh-ed25519-cert-v01@openssh.com"
+            | "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+            | "ecdsa-sha2-nistp384-cert-v01@openssh.com"
+            | "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    )
+}
+
 /// Strip leading whitespace/BOM bytes from a header for PEM/text detection.
 fn skip_leading_whitespace(header: &[u8]) -> &[u8] {
     let mut i = 0;
@@ -163,6 +293,16 @@ pub fn sniff_kind(header: &[u8], path: &Path, file_size: u64) -> DetectedKind {
     // age identity key (may appear in key files with comment lines first)
     if starts_with(trimmed, AGE_KEY_PREFIX) || has_age_key_line(header) {
         return DetectedKind::AgeKey;
+    }
+
+    // OpenSSH multi-line trust files. Filename match is authoritative; for
+    // unnamed/renamed files we fall back to a content heuristic that needs
+    // multiple recognizable entries to fire.
+    if is_authorized_keys_filename(path) || looks_like_authorized_keys(header) {
+        return DetectedKind::SshAuthorizedKeys;
+    }
+    if is_known_hosts_filename(path) || looks_like_known_hosts(header) {
+        return DetectedKind::SshKnownHosts;
     }
 
     // SSH public key (on first non-empty line)
@@ -385,6 +525,57 @@ mod tests {
         let header = b"-----BEGIN PGP MESSAGE-----\ndata";
         let kind = sniff_kind(header, &PathBuf::from("msg.asc"), header.len() as u64);
         assert_eq!(kind, DetectedKind::OpenPgpArmored);
+    }
+
+    #[test]
+    fn detects_authorized_keys_by_filename() {
+        // A single SSH public key line would normally sniff as SshPublicKey,
+        // but a file literally named "authorized_keys" must take precedence.
+        let header = b"ssh-rsa AAAAB3NzaC1yc2EAAA... user@host\n";
+        let kind = sniff_kind(
+            header,
+            &PathBuf::from("authorized_keys"),
+            header.len() as u64,
+        );
+        assert_eq!(kind, DetectedKind::SshAuthorizedKeys);
+    }
+
+    #[test]
+    fn detects_authorized_keys_by_content() {
+        // Multiple key lines, including one with options — no canonical name.
+        let header = b"# my keys\nssh-rsa AAAAB3NzaC1yc2EAAA... alice@host\n\
+                        no-port-forwarding,from=\"10.0.0.1\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... bob@host\n";
+        let kind = sniff_kind(header, &PathBuf::from("keys.txt"), header.len() as u64);
+        assert_eq!(kind, DetectedKind::SshAuthorizedKeys);
+    }
+
+    #[test]
+    fn detects_known_hosts_by_filename() {
+        let header = b"github.com,140.82.114.4 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...\n";
+        let kind = sniff_kind(header, &PathBuf::from("known_hosts"), header.len() as u64);
+        assert_eq!(kind, DetectedKind::SshKnownHosts);
+    }
+
+    #[test]
+    fn detects_known_hosts_with_hashed_host() {
+        // |1|salt|hash hashed-host form, two entries.
+        let header = b"|1|F1E1f8gPzg5VrIWJzNCJjQjFKBQ=|N4i7zd0EIuTakvAlk5gIVtPP4lk= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...\n\
+                        |1|XXSALT2XXX=|XXHASH2XXX= ssh-rsa AAAAB3NzaC1yc2EAAA...\n";
+        let kind = sniff_kind(header, &PathBuf::from("hosts_file"), header.len() as u64);
+        assert_eq!(kind, DetectedKind::SshKnownHosts);
+    }
+
+    #[test]
+    fn single_pubkey_does_not_false_match_authorized_keys() {
+        // One SSH public key line + a canonical .pub filename should still
+        // sniff as SshPublicKey, not authorized_keys.
+        let header = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@host\n";
+        let kind = sniff_kind(
+            header,
+            &PathBuf::from("id_ed25519.pub"),
+            header.len() as u64,
+        );
+        assert_eq!(kind, DetectedKind::SshPublicKey);
     }
 
     #[test]
