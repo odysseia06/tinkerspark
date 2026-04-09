@@ -522,20 +522,30 @@ pub fn build_csr_tree(
             .as_ref()
             .and_then(|s| s.attributes)
             .unwrap_or(csr_range);
+        // Per-attribute SEQUENCE wrapper spans, so each attribute child
+        // points at its own DER bytes instead of the shared [0] wrapper.
+        let attr_wrapper_spans = info_spans
+            .as_ref()
+            .and_then(|s| s.attributes)
+            .map(|ar| der_spans::extract_csr_attribute_spans(csr_der, ar, base))
+            .unwrap_or_default();
+
         let attr_children: Vec<AnalysisNode> = attrs
             .iter()
-            .map(|attr| {
+            .enumerate()
+            .map(|(idx, attr)| {
                 let oid = attr.oid.to_id_string();
+                let range = attr_wrapper_spans.get(idx).copied().unwrap_or(attrs_range);
                 AnalysisNode {
                     id: NodeId::new(),
                     label: oid_name(&oid),
                     kind: "x509_csr_attribute".into(),
-                    range: attrs_range,
+                    range,
                     children: Vec::new(),
                     fields: vec![FieldView {
                         name: "OID".into(),
                         value: oid,
-                        range: None,
+                        range: Some(range),
                     }],
                     diagnostics: Vec::new(),
                 }

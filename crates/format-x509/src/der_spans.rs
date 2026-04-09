@@ -385,6 +385,41 @@ pub fn extract_csr_info_spans(der: &[u8], info_range: ByteRange, base_offset: u6
     spans
 }
 
+/// Walk a CSR's `[0] IMPLICIT attributes` wrapper and return per-attribute
+/// SEQUENCE wrapper spans. Each attribute is `SEQUENCE { OID, SET OF Value }`.
+///
+/// `attributes_range` is the wrapper as captured by [`extract_csr_info_spans`].
+/// Empty result means the wrapper was missing or malformed.
+pub fn extract_csr_attribute_spans(
+    der: &[u8],
+    attributes_range: ByteRange,
+    base_offset: u64,
+) -> Vec<ByteRange> {
+    let mut result = Vec::new();
+    let start = (attributes_range.offset() - base_offset) as usize;
+    // The wrapper itself is the [0] IMPLICIT context tag, which means its
+    // content is a SET OF Attribute (SEQUENCE). Walk the children.
+    let (_, content_off, content_len, _) = match read_tlv(der, start) {
+        Some(t) => t,
+        None => return result,
+    };
+
+    let mut pos = content_off;
+    let end = content_off + content_len;
+    while pos < end {
+        let (tag_byte, _, _, total) = match read_tlv(der, pos) {
+            Some(t) => t,
+            None => break,
+        };
+        if tag_byte != 0x30 {
+            break;
+        }
+        result.push(ByteRange::new(base_offset + pos as u64, total as u64));
+        pos += total;
+    }
+    result
+}
+
 /// Spans for the TBSCertList (the inner SEQUENCE of a CRL).
 ///
 /// TBSCertList is: SEQUENCE { version Version OPTIONAL, signature

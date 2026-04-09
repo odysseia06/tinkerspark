@@ -147,14 +147,24 @@ impl Analyzer for X509Analyzer {
 }
 
 /// Best-effort kind detection for raw DER input. We try the parsers in
-/// order and pick the first one that consumes the bytes cleanly. This is
-/// only used when there's no authoritative PEM label to dispatch on.
+/// order and pick the first one that fully consumes the bytes. The
+/// certificate path is allowed to leave a tail because cert chains are
+/// concatenated certificates handled by [`parse_certificate_chain`]; CSR
+/// and CRL must consume the whole file because there's no chain concept
+/// for them and silently dropping a tail would let valid-prefix-plus-junk
+/// inputs masquerade as well-formed artifacts.
 fn sniff_der_kind(der: &[u8]) -> X509Kind {
     if x509_parser::parse_x509_certificate(der).is_ok() {
         X509Kind::Certificate
-    } else if X509CertificationRequest::from_der(der).is_ok() {
+    } else if matches!(
+        X509CertificationRequest::from_der(der),
+        Ok((rest, _)) if rest.is_empty()
+    ) {
         X509Kind::CertificationRequest
-    } else if CertificateRevocationList::from_der(der).is_ok() {
+    } else if matches!(
+        CertificateRevocationList::from_der(der),
+        Ok((rest, _)) if rest.is_empty()
+    ) {
         X509Kind::CertificateRevocationList
     } else {
         // Default to certificate so the existing error path runs and the
@@ -220,7 +230,21 @@ fn parse_csr(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match X509CertificationRequest::from_der(der_bytes) {
-        Ok((_, csr)) => {
+        Ok((rest, csr)) => {
+            if !rest.is_empty() {
+                let consumed = der_bytes.len() - rest.len();
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "Certification request parser left {} trailing byte(s) at offset 0x{:X}; \
+                         file is not a clean CSR.",
+                        rest.len(),
+                        consumed
+                    ),
+                    range: Some(ByteRange::new(consumed as u64, rest.len() as u64)),
+                });
+                return;
+            }
             let range = ByteRange::new(0, der_bytes.len() as u64);
             let node = tree_builder::build_csr_tree(
                 &csr,
@@ -248,7 +272,21 @@ fn parse_crl(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match CertificateRevocationList::from_der(der_bytes) {
-        Ok((_, crl)) => {
+        Ok((rest, crl)) => {
+            if !rest.is_empty() {
+                let consumed = der_bytes.len() - rest.len();
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "Certificate revocation list parser left {} trailing byte(s) at offset 0x{:X}; \
+                         file is not a clean CRL.",
+                        rest.len(),
+                        consumed
+                    ),
+                    range: Some(ByteRange::new(consumed as u64, rest.len() as u64)),
+                });
+                return;
+            }
             let range = ByteRange::new(0, der_bytes.len() as u64);
             let node = tree_builder::build_crl_tree(
                 &crl,
