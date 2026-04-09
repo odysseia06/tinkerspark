@@ -133,9 +133,22 @@ impl Analyzer for X509Analyzer {
         }
 
         if root_nodes.is_empty() {
-            return Err(AnalyzeError::Parse {
-                message: "No valid X.509 certificate, CSR, or CRL found in data".into(),
-            });
+            // Fold any accumulated Error diagnostics into the parse error so
+            // detailed reasons (e.g. trailing-byte offsets from
+            // parse_csr / parse_crl) reach the caller instead of being
+            // silently dropped along with `report_diagnostics`.
+            let detail = report_diagnostics
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let message = if detail.is_empty() {
+                "No valid X.509 certificate, CSR, or CRL found in data".into()
+            } else {
+                detail
+            };
+            return Err(AnalyzeError::Parse { message });
         }
 
         Ok(AnalysisReport {
@@ -146,25 +159,19 @@ impl Analyzer for X509Analyzer {
     }
 }
 
-/// Best-effort kind detection for raw DER input. We try the parsers in
-/// order and pick the first one that fully consumes the bytes. The
-/// certificate path is allowed to leave a tail because cert chains are
-/// concatenated certificates handled by [`parse_certificate_chain`]; CSR
-/// and CRL must consume the whole file because there's no chain concept
-/// for them and silently dropping a tail would let valid-prefix-plus-junk
-/// inputs masquerade as well-formed artifacts.
+/// Best-effort kind detection for raw DER input. The sniffer's job is only
+/// to pick which parser dispatches; the strict full-input-consumption check
+/// for CSR/CRL lives in [`parse_csr`] and [`parse_crl`] so that a
+/// valid-CSR-prefix + trailing junk file routes to the CSR parser and
+/// surfaces a precise trailing-bytes error instead of falling through to
+/// the certificate path and producing a misleading "failed to parse
+/// certificate" message.
 fn sniff_der_kind(der: &[u8]) -> X509Kind {
     if x509_parser::parse_x509_certificate(der).is_ok() {
         X509Kind::Certificate
-    } else if matches!(
-        X509CertificationRequest::from_der(der),
-        Ok((rest, _)) if rest.is_empty()
-    ) {
+    } else if X509CertificationRequest::from_der(der).is_ok() {
         X509Kind::CertificationRequest
-    } else if matches!(
-        CertificateRevocationList::from_der(der),
-        Ok((rest, _)) if rest.is_empty()
-    ) {
+    } else if CertificateRevocationList::from_der(der).is_ok() {
         X509Kind::CertificateRevocationList
     } else {
         // Default to certificate so the existing error path runs and the

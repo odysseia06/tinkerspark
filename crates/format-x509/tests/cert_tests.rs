@@ -168,21 +168,33 @@ fn parses_csr_der_with_precise_spans() {
 fn csr_der_with_trailing_junk_is_rejected() {
     // Take the real CSR DER fixture and append garbage bytes. The parser
     // would otherwise consume the prefix and silently drop the tail; we
-    // require full-input consumption so this must fail.
+    // require full-input consumption so this must fail with a message
+    // that names both the cause and the offset of the unconsumed tail.
     let mut data = std::fs::read("../../testdata/x509/csr.der").unwrap();
     let original_len = data.len();
-    data.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0xFF]);
+    let trailing = [0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0xFF];
+    data.extend_from_slice(&trailing);
     let src = MemoryByteSource::new(data.clone());
     let handle = make_handle(DetectedKind::X509Der, data.len() as u64);
 
     let analyzer = tinkerspark_format_x509::X509Analyzer;
-    let result = analyzer.analyze(&handle, &src);
+    let err = analyzer
+        .analyze(&handle, &src)
+        .expect_err("valid CSR prefix + junk must error");
+    let msg = err.to_string();
     assert!(
-        result.is_err(),
-        "valid-CSR-prefix + trailing junk must not be accepted as a clean CSR \
-         (original {} bytes, total {} bytes)",
-        original_len,
-        data.len()
+        msg.contains("trailing"),
+        "error should name the trailing bytes; got: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("0x{:X}", original_len)),
+        "error should mention the offset 0x{:X} where the tail starts; got: {msg}",
+        original_len
+    );
+    assert!(
+        msg.contains(&trailing.len().to_string()),
+        "error should mention the trailing byte count {}; got: {msg}",
+        trailing.len()
     );
 }
 
@@ -356,15 +368,30 @@ fn parses_crl_der_with_precise_spans() {
 #[test]
 fn crl_der_with_trailing_junk_is_rejected() {
     let mut data = std::fs::read("../../testdata/x509/crl.der").unwrap();
-    data.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+    let original_len = data.len();
+    let trailing = [0xCA, 0xFE, 0xBA, 0xBE];
+    data.extend_from_slice(&trailing);
     let src = MemoryByteSource::new(data.clone());
     let handle = make_handle(DetectedKind::X509Der, data.len() as u64);
 
     let analyzer = tinkerspark_format_x509::X509Analyzer;
-    let result = analyzer.analyze(&handle, &src);
+    let err = analyzer
+        .analyze(&handle, &src)
+        .expect_err("valid CRL prefix + junk must error");
+    let msg = err.to_string();
     assert!(
-        result.is_err(),
-        "valid-CRL-prefix + trailing junk must not be accepted as a clean CRL"
+        msg.contains("trailing"),
+        "error should name the trailing bytes; got: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("0x{:X}", original_len)),
+        "error should mention the offset 0x{:X}; got: {msg}",
+        original_len
+    );
+    assert!(
+        msg.contains(&trailing.len().to_string()),
+        "error should mention the trailing byte count {}; got: {msg}",
+        trailing.len()
     );
 }
 
