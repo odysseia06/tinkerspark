@@ -525,6 +525,108 @@ fn parses_known_hosts_fixture() {
 }
 
 #[test]
+fn authorized_keys_invalid_utf8_line_is_surfaced_as_diagnostic() {
+    // One valid entry, one line with stray invalid UTF-8 bytes, one more
+    // valid entry. The invalid line must NOT silently disappear — it must
+    // produce a warning diagnostic with its byte range, and the surrounding
+    // entries must still parse correctly.
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(
+        b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl alice@example.com\n",
+    );
+    let invalid_start = data.len() as u64;
+    // 0xFF / 0xFE / 0xFC are all invalid UTF-8 leading bytes.
+    let invalid_line: &[u8] = &[0xFF, 0xFE, 0xFC, 0x80, 0x81, 0x82];
+    data.extend_from_slice(invalid_line);
+    data.push(b'\n');
+    let invalid_len = invalid_line.len() as u64;
+    data.extend_from_slice(
+        b"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDfakeRSAblob== bob@example.com\n",
+    );
+
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::SshAuthorizedKeys, data.len() as u64);
+    let analyzer = tinkerspark_format_ssh::SshAnalyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+    let root = &report.root_nodes[0];
+    assert_eq!(root.kind, "ssh_authorized_keys");
+
+    // Both valid entries must still parse.
+    assert_eq!(
+        root.children.len(),
+        2,
+        "expected 2 valid entries; got: {:?}",
+        root.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+    assert!(root.children[0]
+        .fields
+        .iter()
+        .any(|f| f.name == "Comment" && f.value == "alice@example.com"));
+    assert!(root.children[1]
+        .fields
+        .iter()
+        .any(|f| f.name == "Comment" && f.value == "bob@example.com"));
+
+    // The invalid line must produce a Warning diagnostic with the exact
+    // byte range of the bad bytes.
+    let diag = root
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("not valid UTF-8"))
+        .expect("expected a UTF-8 warning diagnostic");
+    let range = diag
+        .range
+        .expect("UTF-8 diagnostic should carry its byte range");
+    assert_eq!(range.offset(), invalid_start);
+    assert_eq!(range.length(), invalid_len);
+}
+
+#[test]
+fn known_hosts_invalid_utf8_line_is_surfaced_as_diagnostic() {
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(
+        b"github.com,140.82.114.4 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n",
+    );
+    let invalid_start = data.len() as u64;
+    let invalid_line: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
+    data.extend_from_slice(invalid_line);
+    data.push(b'\n');
+    let invalid_len = invalid_line.len() as u64;
+    data.extend_from_slice(
+        b"|1|F1E1f8gPzg5VrIWJzNCJjQjFKBQ=|N4i7zd0EIuTakvAlk5gIVtPP4lk= ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDfakeRSAblob==\n",
+    );
+
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::SshKnownHosts, data.len() as u64);
+    let analyzer = tinkerspark_format_ssh::SshAnalyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+    let root = &report.root_nodes[0];
+    assert_eq!(root.kind, "ssh_known_hosts");
+
+    // Both valid entries (plain + hashed) must still parse.
+    assert_eq!(root.children.len(), 2);
+    assert!(root.children[0]
+        .fields
+        .iter()
+        .any(|f| f.name == "Hostnames" && f.value.contains("github.com")));
+    assert!(root.children[1]
+        .fields
+        .iter()
+        .any(|f| f.name == "Hashed" && f.value == "Yes"));
+
+    let diag = root
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("not valid UTF-8"))
+        .expect("expected a UTF-8 warning diagnostic");
+    let range = diag
+        .range
+        .expect("UTF-8 diagnostic should carry its byte range");
+    assert_eq!(range.offset(), invalid_start);
+    assert_eq!(range.length(), invalid_len);
+}
+
+#[test]
 fn analyzer_claims_authorized_keys_and_known_hosts_kinds() {
     let analyzer = tinkerspark_format_ssh::SshAnalyzer;
     let src = MemoryByteSource::new(vec![0]);

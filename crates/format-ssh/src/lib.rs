@@ -177,10 +177,12 @@ fn parse_public_key_line(raw: &[u8]) -> Result<AnalysisNode, String> {
 // ── authorized_keys / known_hosts parsing ───────────────────────────────
 
 /// Walk a byte buffer line-by-line, returning `(file_offset, line_length,
-/// line_text)` for each line whose contents are valid UTF-8. Skips the
-/// trailing `\r` of CRLF endings. Empty lines are still emitted (the caller
-/// can choose to skip them) so the offsets stay accurate.
-fn iter_lines_with_offsets(data: &[u8]) -> Vec<(u64, u64, &str)> {
+/// Option<line_text>)` for **every** line. Lines that aren't valid UTF-8
+/// come back with `None` so callers can downgrade them to diagnostics
+/// instead of silently dropping them — for a forensic tool, "invalid UTF-8"
+/// must not collapse to "not present". Trailing `\r` of CRLF endings is
+/// stripped before the UTF-8 check.
+fn iter_lines_with_offsets(data: &[u8]) -> Vec<(u64, u64, Option<&str>)> {
     let mut lines = Vec::new();
     let mut start = 0usize;
     while start < data.len() {
@@ -192,9 +194,9 @@ fn iter_lines_with_offsets(data: &[u8]) -> Vec<(u64, u64, &str)> {
         if content_end > start && data[content_end - 1] == b'\r' {
             content_end -= 1;
         }
-        if let Ok(line) = std::str::from_utf8(&data[start..content_end]) {
-            lines.push((start as u64, (content_end - start) as u64, line));
-        }
+        let slice = &data[start..content_end];
+        let text = std::str::from_utf8(slice).ok();
+        lines.push((start as u64, (content_end - start) as u64, text));
         start = if end < data.len() { end + 1 } else { end };
     }
     lines
@@ -226,7 +228,21 @@ fn parse_authorized_keys(data: &[u8]) -> Result<AnalysisNode, String> {
     let mut diagnostics = Vec::new();
     let mut entry_index = 0usize;
 
-    for (line_start, line_len, raw_line) in lines {
+    for (line_start, line_len, maybe_line) in lines {
+        let raw_line = match maybe_line {
+            Some(text) => text,
+            None => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    message: format!(
+                        "authorized_keys line at offset 0x{:X} is not valid UTF-8 ({} bytes); skipped",
+                        line_start, line_len
+                    ),
+                    range: Some(ByteRange::new(line_start, line_len)),
+                });
+                continue;
+            }
+        };
         let line = raw_line.trim_start();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -410,7 +426,21 @@ fn parse_known_hosts(data: &[u8]) -> Result<AnalysisNode, String> {
     let mut diagnostics = Vec::new();
     let mut entry_index = 0usize;
 
-    for (line_start, line_len, raw_line) in lines {
+    for (line_start, line_len, maybe_line) in lines {
+        let raw_line = match maybe_line {
+            Some(text) => text,
+            None => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    message: format!(
+                        "known_hosts line at offset 0x{:X} is not valid UTF-8 ({} bytes); skipped",
+                        line_start, line_len
+                    ),
+                    range: Some(ByteRange::new(line_start, line_len)),
+                });
+                continue;
+            }
+        };
         let line = raw_line.trim_start();
         if line.is_empty() || line.starts_with('#') {
             continue;
