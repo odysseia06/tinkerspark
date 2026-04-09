@@ -6,3 +6,5 @@
 *.swo
 *~
 .DS_Store
+.agents
+/plugins

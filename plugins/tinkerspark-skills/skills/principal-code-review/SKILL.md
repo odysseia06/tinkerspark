@@ -450,10 +450,9 @@ Always use this structure:
   
 
 7. Patch plan
-
+   - 
+   - 
 ```
-
-  
 
 For each finding include:
 
