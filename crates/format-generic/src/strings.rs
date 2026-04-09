@@ -14,8 +14,14 @@ impl StringRegion {
     }
 }
 
-/// Maximum length of a single extracted string (truncate longer runs).
-const MAX_STRING_LEN: usize = 256;
+/// Maximum number of bytes (or, for UTF-8 extraction, codepoints) preserved
+/// in [`StringRegion::content`]. This caps per-string memory while still
+/// being large enough to keep realistic PEM bodies, hex dumps, and inline
+/// base64 payloads intact for downstream classifiers like
+/// [`detect_encoded_sections`]. The full run length is still recorded in
+/// [`StringRegion::length`]; only the cached `content` is bounded. Display
+/// callers should re-truncate via [`truncate_display`] in lib.rs.
+const MAX_STRING_LEN: usize = 4096;
 
 fn is_printable(b: u8) -> bool {
     b.is_ascii_graphic() || b == b' ' || b == b'\t'
@@ -24,6 +30,10 @@ fn is_printable(b: u8) -> bool {
 /// Extract runs of printable ASCII strings from the data.
 ///
 /// Returns up to `max_strings` results, each at least `min_string_len` bytes.
+/// `StringRegion::content` always holds a valid prefix of the actual run
+/// (no display markers like `"..."` are mixed in) so downstream analyzers —
+/// notably [`detect_encoded_sections`] — can classify it without having to
+/// strip presentation noise.
 pub fn extract_strings(
     data: &[u8],
     base_offset: u64,
@@ -45,12 +55,9 @@ pub fn extract_strings(
         } else if let Some(start) = run_start.take() {
             let len = i - start;
             if len >= min_string_len {
-                let display_len = len.min(MAX_STRING_LEN);
-                let content = String::from_utf8_lossy(&data[start..start + display_len]);
-                let mut content = content.into_owned();
-                if len > MAX_STRING_LEN {
-                    content.push_str("...");
-                }
+                let cached_len = len.min(MAX_STRING_LEN);
+                let content =
+                    String::from_utf8_lossy(&data[start..start + cached_len]).into_owned();
                 results.push(StringRegion {
                     offset: base_offset + start as u64,
                     length: len as u64,
@@ -67,12 +74,8 @@ pub fn extract_strings(
     if let Some(start) = run_start {
         let len = data.len() - start;
         if len >= min_string_len && results.len() < max_strings {
-            let display_len = len.min(MAX_STRING_LEN);
-            let content = String::from_utf8_lossy(&data[start..start + display_len]);
-            let mut content = content.into_owned();
-            if len > MAX_STRING_LEN {
-                content.push_str("...");
-            }
+            let cached_len = len.min(MAX_STRING_LEN);
+            let content = String::from_utf8_lossy(&data[start..start + cached_len]).into_owned();
             results.push(StringRegion {
                 offset: base_offset + start as u64,
                 length: len as u64,
@@ -153,14 +156,13 @@ pub fn extract_utf8_strings(
         if had_non_ascii && chars >= min_chars {
             let len_bytes = i - start;
             let raw = String::from_utf8_lossy(&data[start..i]).into_owned();
-            let mut truncated: String = raw.chars().take(MAX_STRING_LEN).collect();
-            if raw.chars().count() > MAX_STRING_LEN {
-                truncated.push_str("...");
-            }
+            // Cap by codepoint count to bound memory while keeping the cached
+            // content a valid prefix of the run for downstream classifiers.
+            let content: String = raw.chars().take(MAX_STRING_LEN).collect();
             results.push(StringRegion {
                 offset: base_offset + start as u64,
                 length: len_bytes as u64,
-                content: truncated,
+                content,
             });
             if results.len() >= max_strings {
                 return results;
@@ -631,6 +633,83 @@ mod tests {
     fn rejects_pure_uppercase_as_base64() {
         // 16 uppercase chars, no digits, no lowercase → fails mix.
         assert_eq!(classify_encoding("ABCDEFGHIJKLMNOP", 16), None);
+    }
+
+    #[test]
+    fn long_hex_blob_survives_extraction_and_classifies() {
+        // 600-char hex blob — well above the old 256-char cap that used to
+        // mutate content with a "..." marker and break classification.
+        let mut data = vec![0x00; 8];
+        let hex: String = std::iter::repeat("deadbeef").take(75).collect();
+        assert_eq!(hex.len(), 600);
+        data.extend_from_slice(hex.as_bytes());
+        data.push(0x00);
+
+        let strings = extract_strings(&data, 0, 4, 200);
+        assert_eq!(strings.len(), 1);
+        // The cached content must be valid hex chars only — no "..." marker.
+        assert!(
+            strings[0].content.chars().all(|c| c.is_ascii_hexdigit()),
+            "cached content must not contain display markers; got: {:?}",
+            &strings[0].content[..32.min(strings[0].content.len())]
+        );
+        // The full run length is still recorded even though content may be
+        // capped at MAX_STRING_LEN.
+        assert_eq!(strings[0].length, 600);
+
+        let sections = detect_encoded_sections(&strings, 32);
+        assert_eq!(
+            sections.len(),
+            1,
+            "long hex blob must classify as Hex even when content is bounded"
+        );
+        assert_eq!(sections[0].kind, EncodingKind::Hex);
+        assert_eq!(sections[0].length, 600, "section length follows the run");
+    }
+
+    #[test]
+    fn very_long_hex_blob_is_capped_but_still_classifies() {
+        // Push beyond the 4096-char cap to make sure the hard cap path works.
+        let mut data = vec![0x00; 4];
+        let hex: String = std::iter::repeat("deadbeef").take(1000).collect(); // 8000 chars
+        data.extend_from_slice(hex.as_bytes());
+        data.push(0x00);
+
+        let strings = extract_strings(&data, 0, 4, 200);
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings[0].length, 8000, "full length is preserved");
+        assert!(
+            strings[0].content.len() <= MAX_STRING_LEN,
+            "cached content is bounded"
+        );
+        assert!(strings[0].content.chars().all(|c| c.is_ascii_hexdigit()));
+        let sections = detect_encoded_sections(&strings, 32);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].kind, EncodingKind::Hex);
+    }
+
+    #[test]
+    fn long_base64_blob_classifies_after_extraction() {
+        // 400-char base64-shaped blob with mixed-case + digits.
+        let mut data = vec![0x00; 4];
+        let chunk = "SGVsbG8gV29ybGQgZm9vYmFy";
+        let b64: String = std::iter::repeat(chunk).take(20).collect();
+        // 24 * 20 = 480 chars (but spaces inside chunk break the printable
+        // run — switch to a no-space sample).
+        let _ = b64;
+        let chunk_clean = "SGVsbG8wV29ybGQwZm9vYmFy"; // 24 chars, all base64-valid
+        let b64: String = std::iter::repeat(chunk_clean).take(20).collect(); // 480 chars
+        assert_eq!(b64.len(), 480);
+        data.extend_from_slice(b64.as_bytes());
+        data.push(0x00);
+
+        let strings = extract_strings(&data, 0, 4, 200);
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings[0].length, 480);
+        let sections = detect_encoded_sections(&strings, 32);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].kind, EncodingKind::Base64);
+        assert_eq!(sections[0].length, 480);
     }
 
     #[test]

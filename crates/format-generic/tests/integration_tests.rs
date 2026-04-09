@@ -135,6 +135,30 @@ fn analyze_generic_balanced(data: Vec<u8>) -> tinkerspark_core_analyze::Analysis
 }
 
 #[test]
+fn detects_le_length_prefixed_chunk_through_full_pipeline() {
+    // 2-byte LE length = 0x0010 (16 bytes body), then 16 plausible bytes,
+    // then a section boundary byte. The chunks pass should surface this
+    // under Balanced and label it LE.
+    let mut data = vec![0x10, 0x00];
+    data.extend_from_slice(&[0xAA; 16]);
+    data.push(0x30);
+    let report = analyze_generic_balanced(data);
+    let chunks = report
+        .root_nodes
+        .iter()
+        .find(|n| n.kind == "chunks")
+        .expect("should have a chunks node");
+    assert!(
+        chunks
+            .children
+            .iter()
+            .any(|c| c.label.contains("2-byte LE")),
+        "chunks node should include the 2-byte LE length-prefixed section: {:?}",
+        chunks.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn detects_le_tlv_chain_through_full_pipeline() {
     // Two 1-byte tag + 2-byte LE length records.
     let data = vec![
@@ -209,6 +233,29 @@ fn detects_key_value_patterns_through_full_pipeline() {
     assert!(kv.children.iter().any(|c| c.label.starts_with("host = ")));
     assert!(kv.children.iter().any(|c| c.label.starts_with("port = ")));
     assert!(kv.children.iter().any(|c| c.label.starts_with("user = ")));
+}
+
+#[test]
+fn long_hex_blob_surfaces_in_encoded_sections_through_full_pipeline() {
+    // 600-char hex blob — past the historical 256-char content cap that
+    // used to mutate StringRegion.content with "..." and break
+    // classification. The full pipeline must still flag it as Hex.
+    let mut data = vec![0x00; 16];
+    let hex: String = std::iter::repeat("deadbeef").take(75).collect();
+    assert_eq!(hex.len(), 600);
+    data.extend_from_slice(hex.as_bytes());
+    data.push(0x00);
+
+    let report = analyze_generic_balanced(data);
+    let encoded = report
+        .root_nodes
+        .iter()
+        .find(|n| n.kind == "encoded_sections")
+        .expect("long hex blob should yield an encoded_sections node");
+    assert!(
+        encoded.children.iter().any(|c| c.label.starts_with("Hex:")),
+        "long hex blob should be classified as Hex"
+    );
 }
 
 #[test]
