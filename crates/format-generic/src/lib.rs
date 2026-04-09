@@ -75,6 +75,9 @@ impl Sensitivity {
                 min_tlv_chain_len: 3,
                 max_tlv_chains: 3,
                 confidence_warn_threshold: 0.5,
+                min_utf8_chars: 6,
+                min_kv_pairs: 3,
+                min_encoded_section_len: 32,
             },
             Self::Balanced => Tunables {
                 min_string_len: 4,
@@ -86,6 +89,9 @@ impl Sensitivity {
                 min_tlv_chain_len: 2,
                 max_tlv_chains: 5,
                 confidence_warn_threshold: 0.4,
+                min_utf8_chars: 4,
+                min_kv_pairs: 2,
+                min_encoded_section_len: 16,
             },
             Self::Aggressive => Tunables {
                 min_string_len: 3,
@@ -97,6 +103,9 @@ impl Sensitivity {
                 min_tlv_chain_len: 2,
                 max_tlv_chains: 10,
                 confidence_warn_threshold: 0.3,
+                min_utf8_chars: 3,
+                min_kv_pairs: 1,
+                min_encoded_section_len: 8,
             },
         }
     }
@@ -118,6 +127,14 @@ pub struct Tunables {
     pub min_tlv_chain_len: usize,
     pub max_tlv_chains: usize,
     pub confidence_warn_threshold: f64,
+    /// Minimum codepoint count for a UTF-8 string to be reported.
+    pub min_utf8_chars: usize,
+    /// Minimum number of detected key-value pairs needed to surface the
+    /// "Key-Value Patterns" node. Below this, the noise isn't worth a node.
+    pub min_kv_pairs: usize,
+    /// Minimum character length for a string to qualify as a hex/base64
+    /// encoded section.
+    pub min_encoded_section_len: usize,
 }
 
 /// Generic fallback analyzer that provides heuristic structural analysis
@@ -279,6 +296,39 @@ impl Analyzer for GenericAnalyzer {
                     value: all_strings.len().to_string(),
                     range: None,
                 }],
+                diagnostics: Vec::new(),
+            });
+        }
+
+        // ── Pass 2b: UTF-8 string extraction ──
+        // Surfaces non-ASCII text runs that the byte-printable scanner above
+        // misses (e.g. CJK, accented Latin, Cyrillic).
+        let utf8_strings =
+            strings::extract_utf8_strings(&data, 0, tunables.min_utf8_chars, tunables.max_strings);
+        if !utf8_strings.is_empty() {
+            let children: Vec<_> = utf8_strings
+                .iter()
+                .map(|s| AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!("\"{}\"", truncate_display(&s.content, 60)),
+                    kind: "utf8_string".into(),
+                    range: s.range(),
+                    children: Vec::new(),
+                    fields: vec![FieldView {
+                        name: "Bytes".into(),
+                        value: format!("{} bytes", s.length),
+                        range: Some(s.range()),
+                    }],
+                    diagnostics: Vec::new(),
+                })
+                .collect();
+            root_nodes.push(AnalysisNode {
+                id: NodeId::new(),
+                label: format!("UTF-8 Strings ({} found)", utf8_strings.len()),
+                kind: "utf8_strings".into(),
+                range: ByteRange::new(0, read_len),
+                children,
+                fields: Vec::new(),
                 diagnostics: Vec::new(),
             });
         }
@@ -476,6 +526,96 @@ impl Analyzer for GenericAnalyzer {
                 children,
                 fields: Vec::new(),
                 diagnostics: Vec::new(),
+            });
+        }
+
+        // ── Pass 5b: Key-value text patterns ──
+        // Pulls structured `key=value` / `key: value` lines out of the
+        // ASCII-extracted strings. Only emits a node when the count clears
+        // the per-mode threshold so single accidental matches stay quiet.
+        let kv_pairs = strings::detect_key_value_pairs(&all_strings);
+        if kv_pairs.len() >= tunables.min_kv_pairs {
+            let children: Vec<_> = kv_pairs
+                .iter()
+                .map(|p| AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!("{} = {}", p.key, truncate_display(&p.value, 60)),
+                    kind: "kv_pair".into(),
+                    range: p.range(),
+                    children: Vec::new(),
+                    fields: vec![
+                        FieldView {
+                            name: "Key".into(),
+                            value: p.key.clone(),
+                            range: Some(p.range()),
+                        },
+                        FieldView {
+                            name: "Value".into(),
+                            value: truncate_display(&p.value, 120),
+                            range: Some(p.range()),
+                        },
+                    ],
+                    diagnostics: Vec::new(),
+                })
+                .collect();
+            root_nodes.push(AnalysisNode {
+                id: NodeId::new(),
+                label: format!("Key-Value Patterns ({} pairs)", kv_pairs.len()),
+                kind: "kv_pairs".into(),
+                range: ByteRange::new(0, read_len),
+                children,
+                fields: Vec::new(),
+                diagnostics: vec![Diagnostic {
+                    severity: Severity::Info,
+                    message: "Heuristic key=value / key: value detection".into(),
+                    range: None,
+                }],
+            });
+        }
+
+        // ── Pass 5c: Encoded sections (hex / base64) ──
+        let encoded_sections =
+            strings::detect_encoded_sections(&all_strings, tunables.min_encoded_section_len);
+        if !encoded_sections.is_empty() {
+            let children: Vec<_> = encoded_sections
+                .iter()
+                .map(|sec| AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!(
+                        "{}: \"{}\"",
+                        sec.kind.label(),
+                        truncate_display(&sec.preview, 60)
+                    ),
+                    kind: "encoded_section".into(),
+                    range: sec.range(),
+                    children: Vec::new(),
+                    fields: vec![
+                        FieldView {
+                            name: "Encoding".into(),
+                            value: sec.kind.label().into(),
+                            range: None,
+                        },
+                        FieldView {
+                            name: "Length".into(),
+                            value: format!("{} bytes", sec.length),
+                            range: Some(sec.range()),
+                        },
+                    ],
+                    diagnostics: Vec::new(),
+                })
+                .collect();
+            root_nodes.push(AnalysisNode {
+                id: NodeId::new(),
+                label: format!("Encoded Sections ({} found)", encoded_sections.len()),
+                kind: "encoded_sections".into(),
+                range: ByteRange::new(0, read_len),
+                children,
+                fields: Vec::new(),
+                diagnostics: vec![Diagnostic {
+                    severity: Severity::Info,
+                    message: "Heuristic hex / base64 classification — may be coincidental".into(),
+                    range: None,
+                }],
             });
         }
 

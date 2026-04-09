@@ -124,6 +124,136 @@ fn png_binary_gets_generic_analysis_with_signature() {
     );
 }
 
+// ── Heuristic coverage expansions (issue #2) ──
+
+fn analyze_generic_balanced(data: Vec<u8>) -> tinkerspark_core_analyze::AnalysisReport {
+    let handle = make_handle("synthetic.bin", DetectedKind::Binary, data.len() as u64);
+    let src = MemoryByteSource::new(data);
+    tinkerspark_format_generic::GenericAnalyzer::new()
+        .analyze(&handle, &src)
+        .unwrap()
+}
+
+#[test]
+fn detects_le_tlv_chain_through_full_pipeline() {
+    // Two 1-byte tag + 2-byte LE length records.
+    let data = vec![
+        0x10, 0x04, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, //
+        0x11, 0x04, 0x00, 0x11, 0x22, 0x33, 0x44, //
+    ];
+    let report = analyze_generic_balanced(data);
+    let tlv = report.root_nodes.iter().find(|n| n.kind == "tlv");
+    assert!(tlv.is_some(), "should expose a tlv node");
+    let tlv = tlv.unwrap();
+    assert!(
+        tlv.children
+            .iter()
+            .any(|c| c.label.contains("2-byte LE length")),
+        "tlv chain children should mention LE encoding: {:?}",
+        tlv.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn detects_varint_tlv_chain_through_full_pipeline() {
+    // 4 elements: tag=0x42, varint len=2, 2 payload bytes.
+    let data: Vec<u8> = vec![
+        0x42, 0x02, 0xAA, 0xBB, //
+        0x42, 0x02, 0xCC, 0xDD, //
+        0x42, 0x02, 0xEE, 0xFF, //
+        0x42, 0x02, 0x11, 0x22, //
+    ];
+    let report = analyze_generic_balanced(data);
+    let tlv = report.root_nodes.iter().find(|n| n.kind == "tlv");
+    assert!(tlv.is_some(), "should expose a tlv node for varint chain");
+    assert!(
+        tlv.unwrap()
+            .children
+            .iter()
+            .any(|c| c.label.contains("varint")),
+        "varint encoding should be labeled in the tlv chain"
+    );
+}
+
+#[test]
+fn detects_utf8_strings_through_full_pipeline() {
+    // "héllo" (5 chars, 6 bytes) + padding so it sits inside binary.
+    let mut data = vec![0x00; 16];
+    data.extend_from_slice("héllo world".as_bytes());
+    data.extend(vec![0x00; 16]);
+    let report = analyze_generic_balanced(data);
+    let utf8 = report.root_nodes.iter().find(|n| n.kind == "utf8_strings");
+    assert!(utf8.is_some(), "should expose a utf8_strings node");
+    assert!(
+        utf8.unwrap()
+            .children
+            .iter()
+            .any(|c| c.label.contains("héllo")),
+        "utf8 children should include the non-ASCII string"
+    );
+}
+
+#[test]
+fn detects_key_value_patterns_through_full_pipeline() {
+    // Three k=v lines separated by NULs so each becomes its own ASCII string.
+    let mut data = Vec::new();
+    for line in &["host=example.com", "port=8080", "user=alice"] {
+        data.extend_from_slice(line.as_bytes());
+        data.push(0x00);
+    }
+    let report = analyze_generic_balanced(data);
+    let kv = report.root_nodes.iter().find(|n| n.kind == "kv_pairs");
+    assert!(kv.is_some(), "should expose a kv_pairs node");
+    let kv = kv.unwrap();
+    assert_eq!(kv.children.len(), 3);
+    assert!(kv.children.iter().any(|c| c.label.starts_with("host = ")));
+    assert!(kv.children.iter().any(|c| c.label.starts_with("port = ")));
+    assert!(kv.children.iter().any(|c| c.label.starts_with("user = ")));
+}
+
+#[test]
+fn detects_encoded_sections_through_full_pipeline() {
+    // A 32-char hex blob and a 24-char base64 blob, separated by NULs.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"deadbeefcafebabe0123456789abcdef");
+    data.push(0x00);
+    data.extend_from_slice(b"SGVsbG8gV29ybGQgZm9vYmFy");
+    data.push(0x00);
+    let report = analyze_generic_balanced(data);
+    let encoded = report
+        .root_nodes
+        .iter()
+        .find(|n| n.kind == "encoded_sections");
+    assert!(encoded.is_some(), "should expose an encoded_sections node");
+    let encoded = encoded.unwrap();
+    assert!(encoded.children.iter().any(|c| c.label.starts_with("Hex:")));
+    assert!(encoded
+        .children
+        .iter()
+        .any(|c| c.label.starts_with("Base64:")));
+}
+
+#[test]
+fn random_bin_does_not_emit_kv_or_encoded_nodes_in_balanced() {
+    // Acceptance criterion from the issue: keep the false-positive rate
+    // acceptable in the default mode. random.bin is the canonical noise
+    // sample — it must not produce key-value or encoded-section nodes
+    // under Balanced sensitivity.
+    let data = std::fs::read("../../testdata/generic/random.bin").unwrap();
+    let report = analyze_generic_balanced(data);
+    assert!(
+        report.root_nodes.iter().all(|n| n.kind != "kv_pairs"),
+        "random.bin should not yield key-value pairs in Balanced mode"
+    );
+    assert!(
+        report
+            .root_nodes
+            .iter()
+            .all(|n| n.kind != "encoded_sections"),
+        "random.bin should not yield encoded sections in Balanced mode"
+    );
+}
+
 // ── Malformed inputs degrade gracefully ──
 
 #[test]

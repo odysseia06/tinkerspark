@@ -46,6 +46,14 @@ pub enum TlvEncoding {
     Tag1Len2Be,
     /// Simple 1-byte tag + 4-byte BE length + value.
     Tag1Len4Be,
+    /// Simple 1-byte tag + 2-byte LE length + value.
+    Tag1Len2Le,
+    /// Simple 1-byte tag + 4-byte LE length + value.
+    Tag1Len4Le,
+    /// Simple 1-byte tag + LEB128 unsigned varint length + value.
+    /// Conservative: requires longer chains than the fixed-width encodings
+    /// because varint headers parse from almost any byte sequence.
+    Tag1LenVarint,
 }
 
 impl TlvEncoding {
@@ -54,9 +62,18 @@ impl TlvEncoding {
             Self::Asn1Ber => "ASN.1 BER/DER",
             Self::Tag1Len2Be => "1-byte tag + 2-byte BE length",
             Self::Tag1Len4Be => "1-byte tag + 4-byte BE length",
+            Self::Tag1Len2Le => "1-byte tag + 2-byte LE length",
+            Self::Tag1Len4Le => "1-byte tag + 4-byte LE length",
+            Self::Tag1LenVarint => "1-byte tag + LEB128 varint length",
         }
     }
 }
+
+/// Minimum chain length for varint TLV detection. Varint headers are very
+/// permissive (almost any byte sequence parses), so we require more elements
+/// than the fixed-width encodings before reporting a chain regardless of the
+/// caller's `min_chain_len`.
+const VARINT_MIN_CHAIN_LEN: usize = 4;
 
 /// Try to detect TLV chains starting from offset 0.
 ///
@@ -76,14 +93,23 @@ pub fn detect_tlv_chains(
 
     let mut chains = Vec::new();
 
-    // Try each encoding scheme.
+    // Try each encoding scheme. Varint requires its own (stricter) floor on
+    // chain length to keep noise out — the encoding accepts almost anything.
     for &encoding in &[
         TlvEncoding::Asn1Ber,
         TlvEncoding::Tag1Len2Be,
         TlvEncoding::Tag1Len4Be,
+        TlvEncoding::Tag1Len2Le,
+        TlvEncoding::Tag1Len4Le,
+        TlvEncoding::Tag1LenVarint,
     ] {
-        if let Some(chain) = try_parse_chain(data, base_offset, encoding, min_chain_len) {
-            if chain.elements.len() >= min_chain_len {
+        let effective_min = if encoding == TlvEncoding::Tag1LenVarint {
+            min_chain_len.max(VARINT_MIN_CHAIN_LEN)
+        } else {
+            min_chain_len
+        };
+        if let Some(chain) = try_parse_chain(data, base_offset, encoding, effective_min) {
+            if chain.elements.len() >= effective_min {
                 chains.push(chain);
             }
         }
@@ -154,8 +180,11 @@ fn try_parse_chain(
 fn try_parse_one(data: &[u8], base_offset: u64, encoding: TlvEncoding) -> Option<TlvCandidate> {
     match encoding {
         TlvEncoding::Asn1Ber => parse_asn1_ber(data, base_offset),
-        TlvEncoding::Tag1Len2Be => parse_tag1_len_be(data, base_offset, 2),
-        TlvEncoding::Tag1Len4Be => parse_tag1_len_be(data, base_offset, 4),
+        TlvEncoding::Tag1Len2Be => parse_tag1_len_int(data, base_offset, 2, true),
+        TlvEncoding::Tag1Len4Be => parse_tag1_len_int(data, base_offset, 4, true),
+        TlvEncoding::Tag1Len2Le => parse_tag1_len_int(data, base_offset, 2, false),
+        TlvEncoding::Tag1Len4Le => parse_tag1_len_int(data, base_offset, 4, false),
+        TlvEncoding::Tag1LenVarint => parse_tag1_len_varint(data, base_offset),
     }
 }
 
@@ -217,7 +246,12 @@ fn parse_asn1_ber(data: &[u8], base_offset: u64) -> Option<TlvCandidate> {
     })
 }
 
-fn parse_tag1_len_be(data: &[u8], base_offset: u64, len_bytes: usize) -> Option<TlvCandidate> {
+fn parse_tag1_len_int(
+    data: &[u8],
+    base_offset: u64,
+    len_bytes: usize,
+    big_endian: bool,
+) -> Option<TlvCandidate> {
     let min_header = 1 + len_bytes;
     if data.len() < min_header {
         return None;
@@ -228,9 +262,11 @@ fn parse_tag1_len_be(data: &[u8], base_offset: u64, len_bytes: usize) -> Option<
         return None;
     }
 
-    let value_len = match len_bytes {
-        2 => u16::from_be_bytes([data[1], data[2]]) as u64,
-        4 => u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as u64,
+    let value_len = match (len_bytes, big_endian) {
+        (2, true) => u16::from_be_bytes([data[1], data[2]]) as u64,
+        (2, false) => u16::from_le_bytes([data[1], data[2]]) as u64,
+        (4, true) => u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as u64,
+        (4, false) => u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as u64,
         _ => return None,
     };
 
@@ -246,10 +282,71 @@ fn parse_tag1_len_be(data: &[u8], base_offset: u64, len_bytes: usize) -> Option<
         tag_len: 1,
         length_field_len: len_bytes as u64,
         value_len,
-        encoding: match len_bytes {
-            2 => TlvEncoding::Tag1Len2Be,
-            _ => TlvEncoding::Tag1Len4Be,
+        encoding: match (len_bytes, big_endian) {
+            (2, true) => TlvEncoding::Tag1Len2Be,
+            (2, false) => TlvEncoding::Tag1Len2Le,
+            (4, true) => TlvEncoding::Tag1Len4Be,
+            (_, _) => TlvEncoding::Tag1Len4Le,
         },
+    })
+}
+
+/// Parse a 1-byte tag followed by an LEB128 unsigned varint length.
+///
+/// LEB128 encodes 7 bits of payload per byte; the high bit (0x80) is the
+/// continuation flag. We cap the varint at 5 bytes (~35-bit value) which is
+/// more than enough for any plausible record length and bounds runtime.
+fn parse_tag1_len_varint(data: &[u8], base_offset: u64) -> Option<TlvCandidate> {
+    if data.len() < 2 {
+        return None;
+    }
+
+    let tag = data[0] as u64;
+    if tag == 0x00 || tag == 0xFF {
+        return None;
+    }
+
+    let mut value_len: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut length_field_len: u64 = 0;
+    let max_varint_bytes = 5;
+    for i in 0..max_varint_bytes {
+        let idx = 1 + i;
+        if idx >= data.len() {
+            return None;
+        }
+        let byte = data[idx];
+        let payload = (byte & 0x7F) as u64;
+        value_len |= payload << shift;
+        length_field_len += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if i + 1 == max_varint_bytes {
+            // Continuation bit set on the last allowed byte → over-long varint.
+            return None;
+        }
+    }
+
+    // Reject zero-length values: a varint chain of zero-length records would
+    // collapse to a single byte per element and matches almost anything.
+    if value_len == 0 {
+        return None;
+    }
+
+    let total = 1 + length_field_len + value_len;
+    if total as usize > data.len() || value_len > 1_000_000 {
+        return None;
+    }
+
+    Some(TlvCandidate {
+        offset: base_offset,
+        tag,
+        tag_len: 1,
+        length_field_len,
+        value_len,
+        encoding: TlvEncoding::Tag1LenVarint,
     })
 }
 
@@ -294,6 +391,104 @@ mod tests {
         let data = &[0x00, 0x00, 0x00, 0x00];
         let chains = detect_tlv_chains(data, 0, 2, 5);
         assert!(chains.is_empty(), "should not find chains in null data");
+    }
+
+    #[test]
+    fn parses_tag1_len2_le_chain() {
+        // Two 4-byte payloads with 1-byte tag + 2-byte LE length each.
+        let data = &[
+            0x10, 0x04, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, // tag=0x10, len=4 LE
+            0x11, 0x04, 0x00, 0x11, 0x22, 0x33, 0x44, // tag=0x11, len=4 LE
+        ];
+        let chains = detect_tlv_chains(data, 0, 2, 5);
+        assert!(
+            chains.iter().any(|c| c.encoding == TlvEncoding::Tag1Len2Le),
+            "should detect Tag1Len2Le chain"
+        );
+        // Same bytes interpreted BE would yield value_len 0x0400 = 1024,
+        // which is far longer than the data, so the BE encoding must NOT
+        // claim this chain.
+        assert!(
+            !chains.iter().any(|c| c.encoding == TlvEncoding::Tag1Len2Be),
+            "BE encoding should not match a clearly-LE payload"
+        );
+    }
+
+    #[test]
+    fn parses_tag1_len4_le_chain() {
+        let data = &[
+            0x20, 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB, // tag=0x20, len=2 LE (4 bytes)
+            0x21, 0x02, 0x00, 0x00, 0x00, 0xCC, 0xDD, // tag=0x21, len=2 LE (4 bytes)
+        ];
+        let chains = detect_tlv_chains(data, 0, 2, 5);
+        assert!(
+            chains.iter().any(|c| c.encoding == TlvEncoding::Tag1Len4Le),
+            "should detect Tag1Len4Le chain"
+        );
+    }
+
+    #[test]
+    fn parses_varint_chain() {
+        // 4 elements: tag=0x42, varint length=2 (single byte), 2 payload bytes.
+        let data: Vec<u8> = vec![
+            0x42, 0x02, 0xAA, 0xBB, // element 0
+            0x42, 0x02, 0xCC, 0xDD, // element 1
+            0x42, 0x02, 0xEE, 0xFF, // element 2
+            0x42, 0x02, 0x11, 0x22, // element 3
+        ];
+        let chains = detect_tlv_chains(&data, 0, 2, 5);
+        assert!(
+            chains
+                .iter()
+                .any(|c| c.encoding == TlvEncoding::Tag1LenVarint),
+            "should detect a 4-element varint chain"
+        );
+    }
+
+    #[test]
+    fn varint_requires_stricter_minimum_chain_len() {
+        // Only 2 elements — below VARINT_MIN_CHAIN_LEN even though caller
+        // passes min_chain_len=2. This blocks varint false positives.
+        let data: Vec<u8> = vec![
+            0x42, 0x02, 0xAA, 0xBB, //
+            0x42, 0x02, 0xCC, 0xDD, //
+        ];
+        let chains = detect_tlv_chains(&data, 0, 2, 5);
+        assert!(
+            !chains
+                .iter()
+                .any(|c| c.encoding == TlvEncoding::Tag1LenVarint),
+            "2-element varint chain should be rejected by VARINT_MIN_CHAIN_LEN"
+        );
+    }
+
+    #[test]
+    fn varint_rejects_zero_length_records() {
+        // Zero-length varint records would let the chain consume only one
+        // byte per element, matching almost anything.
+        let data: Vec<u8> = vec![0x42, 0x00, 0x42, 0x00, 0x42, 0x00, 0x42, 0x00];
+        let chains = detect_tlv_chains(&data, 0, 2, 5);
+        assert!(
+            !chains
+                .iter()
+                .any(|c| c.encoding == TlvEncoding::Tag1LenVarint),
+            "zero-length varint records must not form a chain"
+        );
+    }
+
+    #[test]
+    fn varint_rejects_overlong_encoding() {
+        // 5+ continuation bytes is over-long for our cap; must not parse.
+        let mut data = vec![0x42];
+        data.extend(vec![0x80; 6]);
+        data.extend(vec![0xAA; 32]);
+        let chains = detect_tlv_chains(&data, 0, 2, 5);
+        assert!(
+            !chains
+                .iter()
+                .any(|c| c.encoding == TlvEncoding::Tag1LenVarint),
+            "over-long varint must not produce a chain"
+        );
     }
 
     #[test]
