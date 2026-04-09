@@ -298,12 +298,38 @@ impl EncodedSection {
 /// Walk extracted strings and report any whose content is plausibly an
 /// encoded blob (hex or base64) and at least `min_len` characters long.
 /// Conservative on both forms — see [`EncodingKind`] for the rules.
-pub fn detect_encoded_sections(strings: &[StringRegion], min_len: usize) -> Vec<EncodedSection> {
+///
+/// `data` is the original byte buffer that produced `strings`, with `data[0]`
+/// representing file offset `data_base_offset`. Classification runs against
+/// the full byte run for each region (slicing back into `data`) rather than
+/// the cached `StringRegion::content` prefix, so very long runs whose
+/// suffix isn't actually hex/base64 don't get over-claimed when only the
+/// prefix would have qualified.
+pub fn detect_encoded_sections(
+    strings: &[StringRegion],
+    data: &[u8],
+    data_base_offset: u64,
+    min_len: usize,
+) -> Vec<EncodedSection> {
     let mut results = Vec::new();
     for s in strings {
-        if let Some(kind) = classify_encoding(&s.content, min_len) {
-            let preview: String = s.content.chars().take(32).collect();
-            let preview = if s.content.chars().count() > 32 {
+        let Some(local_start) = s.offset.checked_sub(data_base_offset) else {
+            continue;
+        };
+        let local_start = local_start as usize;
+        let Some(local_end) = local_start.checked_add(s.length as usize) else {
+            continue;
+        };
+        if local_end > data.len() {
+            continue;
+        }
+        // Extracted runs are guaranteed printable ASCII (or valid UTF-8 for
+        // the UTF-8 extractor), so from_utf8_lossy is allocation-free for
+        // the common ASCII case and never produces replacement chars here.
+        let full = String::from_utf8_lossy(&data[local_start..local_end]);
+        if let Some(kind) = classify_encoding(&full, min_len) {
+            let preview: String = full.chars().take(32).collect();
+            let preview = if full.chars().count() > 32 {
                 format!("{preview}...")
             } else {
                 preview
@@ -657,7 +683,7 @@ mod tests {
         // capped at MAX_STRING_LEN.
         assert_eq!(strings[0].length, 600);
 
-        let sections = detect_encoded_sections(&strings, 32);
+        let sections = detect_encoded_sections(&strings, &data, 0, 32);
         assert_eq!(
             sections.len(),
             1,
@@ -683,7 +709,7 @@ mod tests {
             "cached content is bounded"
         );
         assert!(strings[0].content.chars().all(|c| c.is_ascii_hexdigit()));
-        let sections = detect_encoded_sections(&strings, 32);
+        let sections = detect_encoded_sections(&strings, &data, 0, 32);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].kind, EncodingKind::Hex);
     }
@@ -706,21 +732,65 @@ mod tests {
         let strings = extract_strings(&data, 0, 4, 200);
         assert_eq!(strings.len(), 1);
         assert_eq!(strings[0].length, 480);
-        let sections = detect_encoded_sections(&strings, 32);
+        let sections = detect_encoded_sections(&strings, &data, 0, 32);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].kind, EncodingKind::Base64);
         assert_eq!(sections[0].length, 480);
     }
 
     #[test]
+    fn long_run_with_encoded_prefix_and_prose_suffix_is_rejected() {
+        // 4096 valid hex chars followed by 200 prose chars, all in one
+        // contiguous printable run. The cached content (capped at
+        // MAX_STRING_LEN = 4096) holds only the hex prefix, so a
+        // prefix-only classifier would over-claim this as Hex. The
+        // full-byte-run validator must reject it.
+        let mut data = vec![0x00; 4];
+        let hex: String = std::iter::repeat("deadbeef").take(512).collect();
+        assert_eq!(hex.len(), 4096);
+        data.extend_from_slice(hex.as_bytes());
+        // Prose suffix — printable ASCII so it stays in the same string run.
+        data.extend_from_slice(b" hello world this is not hex");
+        data.push(0x00);
+
+        let strings = extract_strings(&data, 0, 4, 200);
+        assert_eq!(strings.len(), 1);
+        let s = &strings[0];
+        assert_eq!(s.length as usize, 4096 + 28);
+        // Cached content was capped — the prefix is hex.
+        assert!(s.content.chars().all(|c| c.is_ascii_hexdigit()));
+        // But the full run is mixed, so classification must reject it.
+        let sections = detect_encoded_sections(&strings, &data, 0, 32);
+        assert!(
+            sections.is_empty(),
+            "mixed-content long run must not be over-claimed; got {:?}",
+            sections.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn detect_encoded_sections_filters_short_and_prose() {
-        let regions = vec![
-            region("deadbeef0123456789abcdef"), // hex, 24 chars
-            region("SGVsbG8gV29ybGQ="),         // base64, 16 chars
-            region("ab12"),                     // too short
-            region("hello world"),              // prose
+        // Build a single backing buffer with each candidate at a unique
+        // offset so the validator can slice the full byte run for each.
+        let candidates: &[&str] = &[
+            "deadbeef0123456789abcdef", // hex, 24 chars
+            "SGVsbG8gV29ybGQ=",         // base64, 16 chars
+            "ab12",                     // too short
+            "hello world",              // prose
         ];
-        let sections = detect_encoded_sections(&regions, 16);
+        let mut data = Vec::new();
+        let mut regions = Vec::new();
+        for c in candidates {
+            let offset = data.len() as u64;
+            data.extend_from_slice(c.as_bytes());
+            data.push(0x00); // separator
+            regions.push(StringRegion {
+                offset,
+                length: c.len() as u64,
+                content: (*c).to_string(),
+            });
+        }
+        let sections = detect_encoded_sections(&regions, &data, 0, 16);
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].kind, EncodingKind::Hex);
         assert_eq!(sections[1].kind, EncodingKind::Base64);

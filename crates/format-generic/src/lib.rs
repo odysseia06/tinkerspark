@@ -574,8 +574,15 @@ impl Analyzer for GenericAnalyzer {
         }
 
         // ── Pass 5c: Encoded sections (hex / base64) ──
-        let encoded_sections =
-            strings::detect_encoded_sections(&all_strings, tunables.min_encoded_section_len);
+        // Validate against the full byte run (not the cached content prefix)
+        // so very long mixed-content runs whose suffix is not actually
+        // encoded don't get over-claimed.
+        let encoded_sections = strings::detect_encoded_sections(
+            &all_strings,
+            &data,
+            0,
+            tunables.min_encoded_section_len,
+        );
         if !encoded_sections.is_empty() {
             let children: Vec<_> = encoded_sections
                 .iter()
