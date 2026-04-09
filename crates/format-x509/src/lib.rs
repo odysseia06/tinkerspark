@@ -11,8 +11,41 @@ mod tree_builder;
 use tinkerspark_core_analyze::{AnalysisReport, AnalyzeError, Analyzer, AnalyzerConfidence};
 use tinkerspark_core_bytes::ByteSource;
 use tinkerspark_core_types::{ByteRange, DetectedKind, Diagnostic, FileHandle, Severity};
+use x509_parser::certification_request::X509CertificationRequest;
+use x509_parser::prelude::FromDer;
+use x509_parser::revocation_list::CertificateRevocationList;
 
 pub struct X509Analyzer;
+
+/// PEM labels we recognize as X.509 artifacts. The trailing closing dashes
+/// matter so a `BEGIN CERTIFICATE` prefix doesn't false-match the inside of
+/// `BEGIN CERTIFICATE REQUEST`.
+const X509_PEM_LABELS: &[&[u8]] = &[
+    b"BEGIN CERTIFICATE-----",
+    b"BEGIN TRUSTED CERTIFICATE-----",
+    b"BEGIN CERTIFICATE REQUEST-----",
+    b"BEGIN NEW CERTIFICATE REQUEST-----",
+    b"BEGIN X509 CRL-----",
+];
+
+/// What kind of X.509 artifact a PEM label represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X509Kind {
+    Certificate,
+    CertificationRequest,
+    CertificateRevocationList,
+}
+
+impl X509Kind {
+    fn from_pem_label(label: &str) -> Option<Self> {
+        match label {
+            "CERTIFICATE" | "TRUSTED CERTIFICATE" => Some(Self::Certificate),
+            "CERTIFICATE REQUEST" | "NEW CERTIFICATE REQUEST" => Some(Self::CertificationRequest),
+            "X509 CRL" => Some(Self::CertificateRevocationList),
+            _ => None,
+        }
+    }
+}
 
 impl Analyzer for X509Analyzer {
     fn id(&self) -> &'static str {
@@ -22,14 +55,16 @@ impl Analyzer for X509Analyzer {
     fn can_analyze(&self, handle: &FileHandle, src: &dyn ByteSource) -> AnalyzerConfidence {
         match &handle.kind {
             DetectedKind::X509Pem | DetectedKind::X509Der => AnalyzerConfidence::High,
-            // Generic PEM might be an X.509 cert we didn't specifically match.
-            // Only claim actual certificate labels — not CRLs or CSRs.
-            // Match the full closing dashes to avoid "BEGIN CERTIFICATE" matching
-            // inside "BEGIN CERTIFICATE REQUEST".
+            // Generic PEM might be a certificate, CSR, or CRL that the sniffer
+            // didn't tag as X509Pem. Match the full closing dashes so a
+            // `BEGIN CERTIFICATE` prefix doesn't false-match the inside of
+            // `BEGIN CERTIFICATE REQUEST`.
             DetectedKind::Pem => {
                 if let Ok(data) = src.read_range(ByteRange::new(0, src.len().min(256))) {
-                    if data.windows(22).any(|w| w == b"BEGIN CERTIFICATE-----") {
-                        return AnalyzerConfidence::High;
+                    for label in X509_PEM_LABELS {
+                        if data.windows(label.len()).any(|w| w == *label) {
+                            return AnalyzerConfidence::High;
+                        }
                     }
                 }
                 AnalyzerConfidence::None
@@ -70,69 +105,36 @@ impl Analyzer for X509Analyzer {
             None => (data.to_vec(), false, None),
         };
 
-        // Try to parse certificate(s).
+        // Decide the artifact type. PEM labels are authoritative when
+        // present; for raw DER we fall back to attempting each parser in
+        // order until one succeeds (cert is the common case).
+        let kind = match pem_label.as_deref().and_then(X509Kind::from_pem_label) {
+            Some(k) => k,
+            None => sniff_der_kind(&der_bytes),
+        };
+
         let mut root_nodes = Vec::new();
-        let mut offset = 0;
 
-        // Handle certificate chains: parse multiple certs from the same data.
-        // For PEM, there might be multiple PEM blocks — we handle the first one here.
-        // For DER, the file might contain concatenated certificates.
-        loop {
-            if offset >= der_bytes.len() {
-                break;
+        match kind {
+            X509Kind::Certificate => {
+                parse_certificate_chain(
+                    &der_bytes,
+                    is_pem,
+                    &mut root_nodes,
+                    &mut report_diagnostics,
+                );
             }
-
-            let remaining = &der_bytes[offset..];
-            if remaining.is_empty() || remaining[0] != 0x30 {
-                break;
+            X509Kind::CertificationRequest => {
+                parse_csr(&der_bytes, is_pem, &mut root_nodes, &mut report_diagnostics);
             }
-
-            match x509_parser::parse_x509_certificate(remaining) {
-                Ok((rest, cert)) => {
-                    let cert_len = remaining.len() - rest.len();
-                    let cert_range = ByteRange::new(offset as u64, cert_len as u64);
-
-                    let cert_index = root_nodes.len();
-                    let label = if pem_label.as_deref() == Some("CERTIFICATE REQUEST") {
-                        format!("Certificate Request {}", cert_index)
-                    } else {
-                        format!("Certificate {}", cert_index)
-                    };
-
-                    let node =
-                        tree_builder::build_cert_tree(&cert, remaining, cert_range, &label, is_pem);
-                    root_nodes.push(node);
-
-                    offset += cert_len;
-                }
-                Err(e) => {
-                    report_diagnostics.push(Diagnostic {
-                        severity: Severity::Error,
-                        message: format!(
-                            "Failed to parse certificate at offset 0x{:X}: {}",
-                            offset, e
-                        ),
-                        range: Some(ByteRange::new(
-                            offset as u64,
-                            (der_bytes.len() - offset) as u64,
-                        )),
-                    });
-                    break;
-                }
+            X509Kind::CertificateRevocationList => {
+                parse_crl(&der_bytes, is_pem, &mut root_nodes, &mut report_diagnostics);
             }
         }
 
         if root_nodes.is_empty() {
             return Err(AnalyzeError::Parse {
-                message: "No valid X.509 certificates found in data".into(),
-            });
-        }
-
-        if root_nodes.len() > 1 {
-            report_diagnostics.push(Diagnostic {
-                severity: Severity::Info,
-                message: format!("Certificate chain: {} certificates found", root_nodes.len()),
-                range: None,
+                message: "No valid X.509 certificate, CSR, or CRL found in data".into(),
             });
         }
 
@@ -141,6 +143,129 @@ impl Analyzer for X509Analyzer {
             root_nodes,
             diagnostics: report_diagnostics,
         })
+    }
+}
+
+/// Best-effort kind detection for raw DER input. We try the parsers in
+/// order and pick the first one that consumes the bytes cleanly. This is
+/// only used when there's no authoritative PEM label to dispatch on.
+fn sniff_der_kind(der: &[u8]) -> X509Kind {
+    if x509_parser::parse_x509_certificate(der).is_ok() {
+        X509Kind::Certificate
+    } else if X509CertificationRequest::from_der(der).is_ok() {
+        X509Kind::CertificationRequest
+    } else if CertificateRevocationList::from_der(der).is_ok() {
+        X509Kind::CertificateRevocationList
+    } else {
+        // Default to certificate so the existing error path runs and the
+        // user sees a parse error rather than a silent skip.
+        X509Kind::Certificate
+    }
+}
+
+fn parse_certificate_chain(
+    der_bytes: &[u8],
+    is_pem: bool,
+    root_nodes: &mut Vec<tinkerspark_core_analyze::AnalysisNode>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut offset = 0;
+    loop {
+        if offset >= der_bytes.len() {
+            break;
+        }
+        let remaining = &der_bytes[offset..];
+        if remaining.is_empty() || remaining[0] != 0x30 {
+            break;
+        }
+        match x509_parser::parse_x509_certificate(remaining) {
+            Ok((rest, cert)) => {
+                let cert_len = remaining.len() - rest.len();
+                let cert_range = ByteRange::new(offset as u64, cert_len as u64);
+                let label = format!("Certificate {}", root_nodes.len());
+                let node =
+                    tree_builder::build_cert_tree(&cert, remaining, cert_range, &label, is_pem);
+                root_nodes.push(node);
+                offset += cert_len;
+            }
+            Err(e) => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "Failed to parse certificate at offset 0x{:X}: {}",
+                        offset, e
+                    ),
+                    range: Some(ByteRange::new(
+                        offset as u64,
+                        (der_bytes.len() - offset) as u64,
+                    )),
+                });
+                break;
+            }
+        }
+    }
+    if root_nodes.len() > 1 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Info,
+            message: format!("Certificate chain: {} certificates found", root_nodes.len()),
+            range: None,
+        });
+    }
+}
+
+fn parse_csr(
+    der_bytes: &[u8],
+    is_pem: bool,
+    root_nodes: &mut Vec<tinkerspark_core_analyze::AnalysisNode>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match X509CertificationRequest::from_der(der_bytes) {
+        Ok((_, csr)) => {
+            let range = ByteRange::new(0, der_bytes.len() as u64);
+            let node = tree_builder::build_csr_tree(
+                &csr,
+                der_bytes,
+                range,
+                "Certificate Signing Request",
+                is_pem,
+            );
+            root_nodes.push(node);
+        }
+        Err(e) => {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!("Failed to parse certification request: {}", e),
+                range: Some(ByteRange::new(0, der_bytes.len() as u64)),
+            });
+        }
+    }
+}
+
+fn parse_crl(
+    der_bytes: &[u8],
+    is_pem: bool,
+    root_nodes: &mut Vec<tinkerspark_core_analyze::AnalysisNode>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match CertificateRevocationList::from_der(der_bytes) {
+        Ok((_, crl)) => {
+            let range = ByteRange::new(0, der_bytes.len() as u64);
+            let node = tree_builder::build_crl_tree(
+                &crl,
+                der_bytes,
+                range,
+                "Certificate Revocation List",
+                is_pem,
+            );
+            root_nodes.push(node);
+        }
+        Err(e) => {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                message: format!("Failed to parse certificate revocation list: {}", e),
+                range: Some(ByteRange::new(0, der_bytes.len() as u64)),
+            });
+        }
     }
 }
 

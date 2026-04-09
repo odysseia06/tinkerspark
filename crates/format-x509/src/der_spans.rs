@@ -319,6 +319,265 @@ pub fn extract_extension_spans(
     result
 }
 
+/// Spans for the CertificationRequestInfo (inner SEQUENCE of a CSR).
+///
+/// CertificationRequestInfo is: SEQUENCE { version INTEGER, subject Name,
+/// subjectPKInfo SubjectPublicKeyInfo, attributes [0] IMPLICIT SET OF
+/// Attribute }. The CSR top-level shape is identical to a certificate
+/// (SEQUENCE { info, sigAlg, sigValue }) so [`extract_cert_spans`] is
+/// reused for the outer envelope and `CertSpans::tbs` carries this CRI.
+#[derive(Debug)]
+pub struct CsrInfoSpans {
+    pub version: Option<ByteRange>,
+    pub subject: Option<ByteRange>,
+    pub subject_pki: Option<ByteRange>,
+    /// The [0] IMPLICIT attributes wrapper, when present.
+    pub attributes: Option<ByteRange>,
+}
+
+/// Extract field spans from a CertificationRequestInfo SEQUENCE.
+pub fn extract_csr_info_spans(der: &[u8], info_range: ByteRange, base_offset: u64) -> CsrInfoSpans {
+    let mut spans = CsrInfoSpans {
+        version: None,
+        subject: None,
+        subject_pki: None,
+        attributes: None,
+    };
+
+    let start = (info_range.offset() - base_offset) as usize;
+    let (tag, content_off, content_len, _) = match read_tlv(der, start) {
+        Some(t) => t,
+        None => return spans,
+    };
+    if tag != 0x30 {
+        return spans;
+    }
+
+    let mut pos = content_off;
+    let end = content_off + content_len;
+    let mut field_index = 0;
+
+    while pos < end {
+        let (tag_byte, _, _, total) = match read_tlv(der, pos) {
+            Some(t) => t,
+            None => break,
+        };
+        let element_range = ByteRange::new(base_offset + pos as u64, total as u64);
+        let class = tag_byte >> 6;
+        let tag_num = tag_byte & 0x1F;
+
+        if class == 2 && tag_num == 0 {
+            // [0] IMPLICIT attributes
+            spans.attributes = Some(element_range);
+        } else {
+            match field_index {
+                0 => spans.version = Some(element_range),
+                1 => spans.subject = Some(element_range),
+                2 => spans.subject_pki = Some(element_range),
+                _ => {}
+            }
+            field_index += 1;
+        }
+
+        pos += total;
+    }
+
+    spans
+}
+
+/// Spans for the TBSCertList (the inner SEQUENCE of a CRL).
+///
+/// TBSCertList is: SEQUENCE { version Version OPTIONAL, signature
+/// AlgorithmIdentifier, issuer Name, thisUpdate Time, nextUpdate Time
+/// OPTIONAL, revokedCertificates SEQUENCE OF ... OPTIONAL,
+/// crlExtensions [0] EXPLICIT Extensions OPTIONAL }. As with CSRs the
+/// outer envelope shape matches a certificate, so [`extract_cert_spans`]
+/// extracts the wrapper and `CertSpans::tbs` carries this TBSCertList.
+#[derive(Debug, Default)]
+pub struct TbsCertListSpans {
+    pub version: Option<ByteRange>,
+    pub signature: Option<ByteRange>,
+    pub issuer: Option<ByteRange>,
+    pub this_update: Option<ByteRange>,
+    pub next_update: Option<ByteRange>,
+    /// The SEQUENCE OF wrapper for revoked certificates, when present.
+    pub revoked_certificates: Option<ByteRange>,
+    /// The [0] EXPLICIT crlExtensions wrapper, when present.
+    pub extensions: Option<ByteRange>,
+}
+
+/// Extract field spans from a TBSCertList SEQUENCE.
+pub fn extract_tbs_cert_list_spans(
+    der: &[u8],
+    tbs_range: ByteRange,
+    base_offset: u64,
+) -> TbsCertListSpans {
+    let mut spans = TbsCertListSpans::default();
+
+    let start = (tbs_range.offset() - base_offset) as usize;
+    let (tag, content_off, content_len, _) = match read_tlv(der, start) {
+        Some(t) => t,
+        None => return spans,
+    };
+    if tag != 0x30 {
+        return spans;
+    }
+
+    let mut pos = content_off;
+    let end = content_off + content_len;
+
+    // Optional version: INTEGER (universal tag 0x02). If the first element is
+    // not an INTEGER, version is absent and the first element is the
+    // signature AlgorithmIdentifier.
+    if pos < end {
+        if let Some((tag_byte, _, _, total)) = read_tlv(der, pos) {
+            if tag_byte == 0x02 {
+                spans.version = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+                pos += total;
+            }
+        }
+    }
+
+    // signature AlgorithmIdentifier (SEQUENCE)
+    if pos < end {
+        if let Some((_, _, _, total)) = read_tlv(der, pos) {
+            spans.signature = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+            pos += total;
+        }
+    }
+
+    // issuer Name (SEQUENCE)
+    if pos < end {
+        if let Some((_, _, _, total)) = read_tlv(der, pos) {
+            spans.issuer = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+            pos += total;
+        }
+    }
+
+    // thisUpdate Time (UTCTime or GeneralizedTime)
+    if pos < end {
+        if let Some((tag_byte, _, _, total)) = read_tlv(der, pos) {
+            if tag_byte == 0x17 || tag_byte == 0x18 {
+                spans.this_update = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+                pos += total;
+            }
+        }
+    }
+
+    // Optional nextUpdate Time
+    if pos < end {
+        if let Some((tag_byte, _, _, total)) = read_tlv(der, pos) {
+            if tag_byte == 0x17 || tag_byte == 0x18 {
+                spans.next_update = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+                pos += total;
+            }
+        }
+    }
+
+    // Optional revokedCertificates SEQUENCE OF (universal SEQUENCE 0x30).
+    // If a [0] EXPLICIT extensions wrapper appears here instead, that
+    // means revokedCertificates was absent.
+    if pos < end {
+        if let Some((tag_byte, _, _, total)) = read_tlv(der, pos) {
+            if tag_byte == 0x30 {
+                spans.revoked_certificates =
+                    Some(ByteRange::new(base_offset + pos as u64, total as u64));
+                pos += total;
+            }
+        }
+    }
+
+    // Optional crlExtensions [0] EXPLICIT
+    if pos < end {
+        if let Some((tag_byte, _, _, total)) = read_tlv(der, pos) {
+            let class = tag_byte >> 6;
+            let tag_num = tag_byte & 0x1F;
+            if class == 2 && tag_num == 0 {
+                spans.extensions = Some(ByteRange::new(base_offset + pos as u64, total as u64));
+            }
+        }
+    }
+
+    spans
+}
+
+/// Span for a single revoked-certificate entry inside a CRL.
+#[derive(Debug)]
+pub struct RevokedEntrySpan {
+    /// The full SEQUENCE wrapper for this entry.
+    pub wrapper: ByteRange,
+    /// The serial INTEGER inside the entry.
+    pub serial: Option<ByteRange>,
+    /// The revocationDate (UTCTime / GeneralizedTime).
+    pub revocation_date: Option<ByteRange>,
+}
+
+/// Walk a `revokedCertificates` SEQUENCE OF wrapper and extract per-entry
+/// spans. The wrapper itself is the outer SEQUENCE; each child is a
+/// `RevokedCertificate` SEQUENCE.
+pub fn extract_revoked_entry_spans(
+    der: &[u8],
+    revoked_range: ByteRange,
+    base_offset: u64,
+) -> Vec<RevokedEntrySpan> {
+    let mut result = Vec::new();
+    let start = (revoked_range.offset() - base_offset) as usize;
+    let (tag, content_off, content_len, _) = match read_tlv(der, start) {
+        Some(t) => t,
+        None => return result,
+    };
+    if tag != 0x30 {
+        return result;
+    }
+
+    let mut pos = content_off;
+    let end = content_off + content_len;
+
+    while pos < end {
+        let (entry_tag, entry_content_off, entry_content_len, entry_total) =
+            match read_tlv(der, pos) {
+                Some(t) => t,
+                None => break,
+            };
+        if entry_tag != 0x30 {
+            break;
+        }
+        let wrapper = ByteRange::new(base_offset + pos as u64, entry_total as u64);
+
+        // Inside the entry: serial INTEGER, revocationDate Time, optional extensions.
+        let mut inner = entry_content_off;
+        let inner_end = entry_content_off + entry_content_len;
+        let mut serial = None;
+        let mut revocation_date = None;
+
+        if inner < inner_end {
+            if let Some((tag_byte, _, _, total)) = read_tlv(der, inner) {
+                if tag_byte == 0x02 {
+                    serial = Some(ByteRange::new(base_offset + inner as u64, total as u64));
+                    inner += total;
+                }
+            }
+        }
+        if inner < inner_end {
+            if let Some((tag_byte, _, _, total)) = read_tlv(der, inner) {
+                if tag_byte == 0x17 || tag_byte == 0x18 {
+                    revocation_date =
+                        Some(ByteRange::new(base_offset + inner as u64, total as u64));
+                }
+            }
+        }
+
+        result.push(RevokedEntrySpan {
+            wrapper,
+            serial,
+            revocation_date,
+        });
+        pos += entry_total;
+    }
+
+    result
+}
+
 /// Walk inside SubjectPublicKeyInfo to extract AlgorithmIdentifier and
 /// subjectPublicKey spans.
 ///

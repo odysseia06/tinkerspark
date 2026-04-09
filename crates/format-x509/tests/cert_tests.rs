@@ -84,6 +84,238 @@ fn rejects_garbage_data() {
     assert!(result.is_err(), "should fail on garbage data");
 }
 
+// ── CSR (issue #3) ──
+
+#[test]
+fn parses_csr_pem() {
+    let data = std::fs::read("../../testdata/x509/csr.pem").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::Pem, data.len() as u64);
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+
+    assert_eq!(report.analyzer_id, "x509");
+    assert_eq!(report.root_nodes.len(), 1);
+    let csr = &report.root_nodes[0];
+    assert_eq!(csr.kind, "x509_csr");
+
+    // CSR should have subject, public key, and signature children. No issuer.
+    let kinds: Vec<&str> = csr.children.iter().map(|c| c.kind.as_str()).collect();
+    assert!(kinds.contains(&"x509_csr_subject"));
+    assert!(kinds.contains(&"x509_csr_public_key"));
+    assert!(kinds.contains(&"x509_csr_signature"));
+    assert!(
+        !kinds.iter().any(|k| k.contains("issuer")),
+        "CSRs have no issuer"
+    );
+
+    // Subject should match what we generated.
+    let subject_field = csr.fields.iter().find(|f| f.name == "Subject").unwrap();
+    assert!(subject_field.value.contains("CN=tinkerspark-test"));
+
+    // PEM diagnostic must be present.
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("PEM-encoded")));
+}
+
+#[test]
+fn parses_csr_der_with_precise_spans() {
+    let data = std::fs::read("../../testdata/x509/csr.der").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::X509Der, data.len() as u64);
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+
+    assert_eq!(report.analyzer_id, "x509");
+    let csr = &report.root_nodes[0];
+    assert_eq!(csr.kind, "x509_csr");
+    assert_eq!(csr.range.offset(), 0);
+    assert_eq!(csr.range.length(), data.len() as u64);
+
+    // The subject child must have a precise sub-range, not the full CSR.
+    let subject = csr
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_csr_subject")
+        .unwrap();
+    assert!(subject.range.length() < csr.range.length());
+    assert!(subject.range.offset() > 0);
+
+    // The public key child has its own SPKI sub-spans (algorithm + key bits).
+    let pubkey = csr
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_csr_public_key")
+        .unwrap();
+    let spki_kinds: Vec<&str> = pubkey.children.iter().map(|c| c.kind.as_str()).collect();
+    assert!(spki_kinds.contains(&"x509_spki_algorithm"));
+    assert!(spki_kinds.contains(&"x509_spki_key_bits"));
+
+    // Signature wraps the outer BIT STRING and must be inside the CSR range.
+    let sig = csr
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_csr_signature")
+        .unwrap();
+    assert!(sig.range.length() < csr.range.length());
+}
+
+#[test]
+fn malformed_csr_fails_gracefully() {
+    let data =
+        b"-----BEGIN CERTIFICATE REQUEST-----\nMIIBFake==\n-----END CERTIFICATE REQUEST-----\n";
+    let src = MemoryByteSource::new(data.to_vec());
+    let handle = make_handle(DetectedKind::Pem, data.len() as u64);
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+    let result = analyzer.analyze(&handle, &src);
+    // Should fail (no parseable CSR), not panic.
+    assert!(result.is_err());
+}
+
+// ── CRL (issue #3) ──
+
+#[test]
+fn parses_crl_pem() {
+    let data = std::fs::read("../../testdata/x509/crl.pem").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::Pem, data.len() as u64);
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+
+    assert_eq!(report.analyzer_id, "x509");
+    let crl = &report.root_nodes[0];
+    assert_eq!(crl.kind, "x509_crl");
+
+    // CRL must have an issuer, a revoked-list (the fixture has one entry),
+    // and a signature.
+    let kinds: Vec<&str> = crl.children.iter().map(|c| c.kind.as_str()).collect();
+    assert!(kinds.contains(&"x509_crl_issuer"));
+    assert!(kinds.contains(&"x509_crl_revoked_list"));
+    assert!(kinds.contains(&"x509_crl_signature"));
+
+    // Top-level fields should include the update timestamps.
+    let field_names: Vec<&str> = crl.fields.iter().map(|f| f.name.as_str()).collect();
+    assert!(field_names.contains(&"This Update"));
+    assert!(field_names.contains(&"Next Update"));
+    assert!(field_names.contains(&"Issuer"));
+
+    // The revoked list should have at least one entry (we revoked serial 01).
+    let revoked = crl
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_crl_revoked_list")
+        .unwrap();
+    assert!(!revoked.children.is_empty());
+    let entry = &revoked.children[0];
+    assert_eq!(entry.kind, "x509_crl_revoked");
+    let serial_field = entry.fields.iter().find(|f| f.name == "Serial").unwrap();
+    assert!(serial_field.value.contains("01"));
+}
+
+#[test]
+fn parses_crl_der_with_precise_spans() {
+    let data = std::fs::read("../../testdata/x509/crl.der").unwrap();
+    let src = MemoryByteSource::new(data.clone());
+    let handle = make_handle(DetectedKind::X509Der, data.len() as u64);
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+    let report = analyzer.analyze(&handle, &src).unwrap();
+
+    assert_eq!(report.analyzer_id, "x509");
+    let crl = &report.root_nodes[0];
+    assert_eq!(crl.kind, "x509_crl");
+    assert_eq!(crl.range.offset(), 0);
+    assert_eq!(crl.range.length(), data.len() as u64);
+
+    // Issuer span should be a strict sub-range of the CRL.
+    let issuer = crl
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_crl_issuer")
+        .unwrap();
+    assert!(issuer.range.length() < crl.range.length());
+    assert!(issuer.range.offset() > 0);
+
+    // The revoked entry should have a wrapper span inside the CRL and a
+    // non-empty serial sub-range.
+    let revoked = crl
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_crl_revoked_list")
+        .unwrap();
+    assert!(revoked.range.length() < crl.range.length());
+    let entry = &revoked.children[0];
+    assert!(entry.range.length() < crl.range.length());
+    assert!(entry.range.offset() >= revoked.range.offset());
+    let serial_range = entry
+        .fields
+        .iter()
+        .find(|f| f.name == "Serial")
+        .unwrap()
+        .range
+        .expect("revoked serial should have a DER span");
+    assert!(serial_range.length() > 0);
+
+    // CRL extensions are present (we set crlNumber via openssl ca).
+    let exts = crl
+        .children
+        .iter()
+        .find(|c| c.kind == "x509_crl_extensions")
+        .expect("openssl-generated CRL should have crlNumber extension");
+    assert!(!exts.children.is_empty());
+}
+
+#[test]
+fn malformed_crl_fails_gracefully() {
+    let data = b"-----BEGIN X509 CRL-----\nMIIBFake==\n-----END X509 CRL-----\n";
+    let src = MemoryByteSource::new(data.to_vec());
+    let handle = make_handle(DetectedKind::Pem, data.len() as u64);
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+    let result = analyzer.analyze(&handle, &src);
+    assert!(result.is_err());
+}
+
+#[test]
+fn x509_analyzer_claims_csr_and_crl_pem() {
+    use tinkerspark_core_analyze::AnalyzerConfidence;
+
+    let analyzer = tinkerspark_format_x509::X509Analyzer;
+
+    let csr_data =
+        b"-----BEGIN CERTIFICATE REQUEST-----\nMIIBFake==\n-----END CERTIFICATE REQUEST-----\n";
+    let csr_src = MemoryByteSource::new(csr_data.to_vec());
+    let csr_handle = make_handle(DetectedKind::Pem, csr_data.len() as u64);
+    assert_eq!(
+        analyzer.can_analyze(&csr_handle, &csr_src),
+        AnalyzerConfidence::High
+    );
+
+    let crl_data = b"-----BEGIN X509 CRL-----\nMIIBFake==\n-----END X509 CRL-----\n";
+    let crl_src = MemoryByteSource::new(crl_data.to_vec());
+    let crl_handle = make_handle(DetectedKind::Pem, crl_data.len() as u64);
+    assert_eq!(
+        analyzer.can_analyze(&crl_handle, &crl_src),
+        AnalyzerConfidence::High
+    );
+
+    // The closing-dashes filter must still reject `BEGIN CERTIFICATE` prefix
+    // matches that come from inside an unrelated label.
+    let unrelated = b"-----BEGIN UNRELATED CERTIFICATE FAKE-----\nx\n-----END UNRELATED CERTIFICATE FAKE-----\n";
+    let unrelated_src = MemoryByteSource::new(unrelated.to_vec());
+    let unrelated_handle = make_handle(DetectedKind::Pem, unrelated.len() as u64);
+    assert_eq!(
+        analyzer.can_analyze(&unrelated_handle, &unrelated_src),
+        AnalyzerConfidence::None
+    );
+}
+
 #[test]
 fn parses_der_certificate_with_precise_spans() {
     let data = std::fs::read("../../testdata/x509/self-signed.der").unwrap();

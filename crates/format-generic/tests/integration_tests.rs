@@ -419,9 +419,12 @@ fn dedicated_analyzers_have_higher_confidence_than_generic() {
 
 // ── Regression tests for review findings ──
 
-// H1: CRL/CSR PEM should NOT be classified as X509Pem — they should fall
-// through to generic Pem and be handled by the generic fallback (or a future
-// dedicated analyzer), not black-holed by X509Analyzer.
+// CRL/CSR PEM should not be sniffed as X509Pem (the sniffer still leaves
+// them as generic Pem). Issue #3 lets X509Analyzer claim them by label, but
+// since these fixtures use a fake base64 body the parse fails and the
+// registry's parse-error fallback hands the file to the generic analyzer.
+// The end-to-end "garbage CSR/CRL routes to generic" outcome is the
+// regression these tests now lock down.
 #[test]
 fn crl_pem_routes_to_generic_not_x509() {
     let data = b"-----BEGIN X509 CRL-----\nMIIBFake==\n-----END X509 CRL-----\n";
@@ -561,24 +564,26 @@ fn jwk_set_children_have_nonempty_ranges() {
     }
 }
 
-// Low: best_match() should not return x509 for CRL/CSR PEM.
+// Issue #3: X509Analyzer now handles CSR and CRL PEM, so best_match should
+// route those labels to x509 — and the registry's parse-error fallback still
+// routes garbage CSR/CRL bodies to the generic analyzer (covered separately).
 #[test]
-fn best_match_does_not_return_x509_for_crl_pem() {
+fn best_match_returns_x509_for_crl_pem() {
     let data = b"-----BEGIN X509 CRL-----\nMIIBFake==\n-----END X509 CRL-----\n";
     let src = MemoryByteSource::new(data.to_vec());
     let handle = make_handle("crl.pem", DetectedKind::Pem, data.len() as u64);
     let registry = build_registry();
 
     let (analyzer, _) = registry.best_match(&handle, &src).unwrap();
-    assert_ne!(
+    assert_eq!(
         analyzer.id(),
         "x509",
-        "best_match should not return x509 for CRL PEM"
+        "best_match should return x509 for CRL PEM (issue #3)"
     );
 }
 
 #[test]
-fn best_match_does_not_return_x509_for_csr_pem() {
+fn best_match_returns_x509_for_csr_pem() {
     let data =
         b"-----BEGIN CERTIFICATE REQUEST-----\nMIIBFake==\n-----END CERTIFICATE REQUEST-----\n";
     let src = MemoryByteSource::new(data.to_vec());
@@ -586,10 +591,10 @@ fn best_match_does_not_return_x509_for_csr_pem() {
     let registry = build_registry();
 
     let (analyzer, _) = registry.best_match(&handle, &src).unwrap();
-    assert_ne!(
+    assert_eq!(
         analyzer.id(),
         "x509",
-        "best_match should not return x509 for CSR PEM"
+        "best_match should return x509 for CSR PEM (issue #3)"
     );
 }
 

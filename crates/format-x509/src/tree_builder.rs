@@ -2,7 +2,9 @@ use crate::der_spans;
 use tinkerspark_core_analyze::{AnalysisNode, FieldView};
 use tinkerspark_core_types::{ByteRange, Diagnostic, NodeId, Severity};
 use x509_parser::certificate::X509Certificate;
+use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::prelude::*;
+use x509_parser::revocation_list::CertificateRevocationList;
 
 /// Build an analysis tree for a single X.509 certificate.
 ///
@@ -390,6 +392,446 @@ fn oid_name(oid_str: &str) -> String {
         "2.5.29.35" => "AuthorityKeyIdentifier".into(),
         "2.5.29.37" => "ExtendedKeyUsage".into(),
         _ => oid_str.to_string(),
+    }
+}
+
+/// Build an analysis tree for an X.509 certification request (CSR).
+///
+/// CSRs share the outer 3-element SEQUENCE shape of certificates
+/// (`SEQUENCE { CertificationRequestInfo, signatureAlgorithm, signature }`),
+/// so [`der_spans::extract_cert_spans`] is reused for the envelope and
+/// `CertSpans::tbs` carries the CertificationRequestInfo span.
+pub fn build_csr_tree(
+    csr: &X509CertificationRequest<'_>,
+    csr_der: &[u8],
+    csr_range: ByteRange,
+    label: &str,
+    is_pem: bool,
+) -> AnalysisNode {
+    let info = &csr.certification_request_info;
+    let base = csr_range.offset();
+
+    let outer_spans = der_spans::extract_cert_spans(csr_der, base);
+    let info_spans = outer_spans
+        .as_ref()
+        .map(|cs| der_spans::extract_csr_info_spans(csr_der, cs.tbs, base));
+
+    let mut children = Vec::new();
+    let mut top_fields = Vec::new();
+    let mut top_diagnostics = Vec::new();
+
+    // ── Version ──
+    top_fields.push(FieldView {
+        name: "Version".into(),
+        value: format!("v{}", info.version.0 + 1),
+        range: info_spans.as_ref().and_then(|s| s.version),
+    });
+
+    // ── Subject ──
+    let subject_str = format_x509_name(&info.subject);
+    let subject_range = info_spans
+        .as_ref()
+        .and_then(|s| s.subject)
+        .unwrap_or(csr_range);
+    children.push(AnalysisNode {
+        id: NodeId::new(),
+        label: "Subject".into(),
+        kind: "x509_csr_subject".into(),
+        range: subject_range,
+        children: Vec::new(),
+        fields: name_fields(&info.subject),
+        diagnostics: Vec::new(),
+    });
+    top_fields.push(FieldView {
+        name: "Subject".into(),
+        value: subject_str,
+        range: info_spans.as_ref().and_then(|s| s.subject),
+    });
+
+    // ── Subject Public Key Info ──
+    let spki = &info.subject_pki;
+    let pk_algo = oid_name(&spki.algorithm.algorithm.to_id_string());
+    let pk_bits = spki.subject_public_key.data.len() * 8;
+    let spki_range = info_spans
+        .as_ref()
+        .and_then(|s| s.subject_pki)
+        .unwrap_or(csr_range);
+    let spki_sub = info_spans
+        .as_ref()
+        .and_then(|s| s.subject_pki)
+        .and_then(|sr| der_spans::extract_spki_spans(csr_der, sr, base));
+    let mut spki_children = Vec::new();
+    if let Some(ref ss) = spki_sub {
+        spki_children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("Algorithm: {}", pk_algo),
+            kind: "x509_spki_algorithm".into(),
+            range: ss.algorithm,
+            children: Vec::new(),
+            fields: vec![FieldView {
+                name: "Algorithm".into(),
+                value: pk_algo.clone(),
+                range: Some(ss.algorithm),
+            }],
+            diagnostics: Vec::new(),
+        });
+        spki_children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("Public Key Bits ({} bits)", pk_bits),
+            kind: "x509_spki_key_bits".into(),
+            range: ss.subject_public_key,
+            children: Vec::new(),
+            fields: vec![FieldView {
+                name: "Size".into(),
+                value: format!("{} bits", pk_bits),
+                range: Some(ss.subject_public_key),
+            }],
+            diagnostics: Vec::new(),
+        });
+    }
+    children.push(AnalysisNode {
+        id: NodeId::new(),
+        label: "Subject Public Key".into(),
+        kind: "x509_csr_public_key".into(),
+        range: spki_range,
+        children: spki_children,
+        fields: vec![
+            FieldView {
+                name: "Algorithm".into(),
+                value: pk_algo.clone(),
+                range: spki_sub.as_ref().map(|s| s.algorithm),
+            },
+            FieldView {
+                name: "Key Size".into(),
+                value: format!("{} bits", pk_bits),
+                range: spki_sub.as_ref().map(|s| s.subject_public_key),
+            },
+        ],
+        diagnostics: Vec::new(),
+    });
+    top_fields.push(FieldView {
+        name: "Public Key Algorithm".into(),
+        value: pk_algo,
+        range: info_spans.as_ref().and_then(|s| s.subject_pki),
+    });
+
+    // ── Attributes (CSR equivalent of cert extensions) ──
+    let attrs = info.attributes();
+    if !attrs.is_empty() {
+        let attrs_range = info_spans
+            .as_ref()
+            .and_then(|s| s.attributes)
+            .unwrap_or(csr_range);
+        let attr_children: Vec<AnalysisNode> = attrs
+            .iter()
+            .map(|attr| {
+                let oid = attr.oid.to_id_string();
+                AnalysisNode {
+                    id: NodeId::new(),
+                    label: oid_name(&oid),
+                    kind: "x509_csr_attribute".into(),
+                    range: attrs_range,
+                    children: Vec::new(),
+                    fields: vec![FieldView {
+                        name: "OID".into(),
+                        value: oid,
+                        range: None,
+                    }],
+                    diagnostics: Vec::new(),
+                }
+            })
+            .collect();
+        children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("Attributes ({})", attrs.len()),
+            kind: "x509_csr_attributes".into(),
+            range: attrs_range,
+            children: attr_children,
+            fields: Vec::new(),
+            diagnostics: Vec::new(),
+        });
+    }
+
+    // ── Signature ──
+    let sig_algo = oid_name(&csr.signature_algorithm.algorithm.to_id_string());
+    let sig_algo_range = outer_spans.as_ref().map(|s| s.signature_algorithm);
+    let sig_value_range = outer_spans.as_ref().map(|s| s.signature_value);
+    children.push(AnalysisNode {
+        id: NodeId::new(),
+        label: "Signature".into(),
+        kind: "x509_csr_signature".into(),
+        range: sig_value_range.unwrap_or(csr_range),
+        children: Vec::new(),
+        fields: vec![
+            FieldView {
+                name: "Algorithm".into(),
+                value: sig_algo,
+                range: sig_algo_range,
+            },
+            FieldView {
+                name: "Size".into(),
+                value: format!("{} bytes", csr.signature_value.data.len()),
+                range: sig_value_range,
+            },
+        ],
+        diagnostics: Vec::new(),
+    });
+
+    if is_pem {
+        top_diagnostics.push(Diagnostic {
+            severity: Severity::Info,
+            message: "Byte ranges refer to decoded DER content, not PEM text".into(),
+            range: None,
+        });
+    }
+
+    AnalysisNode {
+        id: NodeId::new(),
+        label: label.into(),
+        kind: "x509_csr".into(),
+        range: outer_spans
+            .as_ref()
+            .map(|s| s.certificate)
+            .unwrap_or(csr_range),
+        children,
+        fields: top_fields,
+        diagnostics: top_diagnostics,
+    }
+}
+
+/// Build an analysis tree for an X.509 certificate revocation list (CRL).
+pub fn build_crl_tree(
+    crl: &CertificateRevocationList<'_>,
+    crl_der: &[u8],
+    crl_range: ByteRange,
+    label: &str,
+    is_pem: bool,
+) -> AnalysisNode {
+    let tbs = &crl.tbs_cert_list;
+    let base = crl_range.offset();
+
+    let outer_spans = der_spans::extract_cert_spans(crl_der, base);
+    let tbs_spans = outer_spans
+        .as_ref()
+        .map(|cs| der_spans::extract_tbs_cert_list_spans(crl_der, cs.tbs, base));
+
+    let mut children = Vec::new();
+    let mut top_fields = Vec::new();
+    let mut top_diagnostics = Vec::new();
+
+    // ── Version ──
+    if let Some(version) = tbs.version {
+        top_fields.push(FieldView {
+            name: "Version".into(),
+            value: format!("v{}", version.0 + 1),
+            range: tbs_spans.as_ref().and_then(|s| s.version),
+        });
+    }
+
+    // ── Signature Algorithm (TBS inner) ──
+    top_fields.push(FieldView {
+        name: "Signature Algorithm".into(),
+        value: oid_name(&tbs.signature.algorithm.to_id_string()),
+        range: tbs_spans.as_ref().and_then(|s| s.signature),
+    });
+
+    // ── Issuer ──
+    let issuer_str = format_x509_name(&tbs.issuer);
+    let issuer_range = tbs_spans
+        .as_ref()
+        .and_then(|s| s.issuer)
+        .unwrap_or(crl_range);
+    children.push(AnalysisNode {
+        id: NodeId::new(),
+        label: "Issuer".into(),
+        kind: "x509_crl_issuer".into(),
+        range: issuer_range,
+        children: Vec::new(),
+        fields: name_fields(&tbs.issuer),
+        diagnostics: Vec::new(),
+    });
+    top_fields.push(FieldView {
+        name: "Issuer".into(),
+        value: issuer_str,
+        range: tbs_spans.as_ref().and_then(|s| s.issuer),
+    });
+
+    // ── Update Times ──
+    let this_update = format!("{}", tbs.this_update);
+    top_fields.push(FieldView {
+        name: "This Update".into(),
+        value: this_update,
+        range: tbs_spans.as_ref().and_then(|s| s.this_update),
+    });
+    if let Some(next) = tbs.next_update {
+        top_fields.push(FieldView {
+            name: "Next Update".into(),
+            value: format!("{}", next),
+            range: tbs_spans.as_ref().and_then(|s| s.next_update),
+        });
+    }
+
+    // ── Revoked Certificates ──
+    let revoked: Vec<_> = crl.iter_revoked_certificates().collect();
+    if !revoked.is_empty() {
+        let revoked_range = tbs_spans
+            .as_ref()
+            .and_then(|s| s.revoked_certificates)
+            .unwrap_or(crl_range);
+        let entry_spans = tbs_spans
+            .as_ref()
+            .and_then(|s| s.revoked_certificates)
+            .map(|rr| der_spans::extract_revoked_entry_spans(crl_der, rr, base))
+            .unwrap_or_default();
+
+        let entry_children: Vec<AnalysisNode> = revoked
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let serial_hex = entry
+                    .raw_serial()
+                    .iter()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<Vec<_>>()
+                    .join(":");
+                let entry_span = entry_spans.get(idx);
+                let wrapper_range = entry_span.map(|e| e.wrapper).unwrap_or(revoked_range);
+                AnalysisNode {
+                    id: NodeId::new(),
+                    label: format!("Revoked: {}", serial_hex),
+                    kind: "x509_crl_revoked".into(),
+                    range: wrapper_range,
+                    children: Vec::new(),
+                    fields: vec![
+                        FieldView {
+                            name: "Serial".into(),
+                            value: serial_hex,
+                            range: entry_span.and_then(|e| e.serial),
+                        },
+                        FieldView {
+                            name: "Revocation Date".into(),
+                            value: format!("{}", entry.revocation_date),
+                            range: entry_span.and_then(|e| e.revocation_date),
+                        },
+                    ],
+                    diagnostics: Vec::new(),
+                }
+            })
+            .collect();
+
+        children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("Revoked Certificates ({})", revoked.len()),
+            kind: "x509_crl_revoked_list".into(),
+            range: revoked_range,
+            children: entry_children,
+            fields: vec![FieldView {
+                name: "Count".into(),
+                value: revoked.len().to_string(),
+                range: None,
+            }],
+            diagnostics: Vec::new(),
+        });
+    }
+
+    // ── CRL Extensions ──
+    let extensions = tbs.extensions();
+    if !extensions.is_empty() {
+        let ext_wrapper_spans = tbs_spans
+            .as_ref()
+            .and_then(|s| s.extensions)
+            .map(|er| der_spans::extract_extension_spans(crl_der, er, base))
+            .unwrap_or_default();
+
+        let mut ext_children = Vec::new();
+        for (idx, ext) in extensions.iter().enumerate() {
+            let oid_str = oid_name(&ext.oid.to_id_string());
+            let critical_str = if ext.critical { " (critical)" } else { "" };
+            let ext_range = ext_wrapper_spans
+                .get(idx)
+                .map(|es| es.wrapper)
+                .or_else(|| compute_field_range(crl_der, ext.value, base))
+                .unwrap_or(crl_range);
+            ext_children.push(AnalysisNode {
+                id: NodeId::new(),
+                label: format!("{}{}", oid_str, critical_str),
+                kind: "x509_crl_extension".into(),
+                range: ext_range,
+                children: Vec::new(),
+                fields: vec![
+                    FieldView {
+                        name: "OID".into(),
+                        value: ext.oid.to_id_string(),
+                        range: None,
+                    },
+                    FieldView {
+                        name: "Critical".into(),
+                        value: ext.critical.to_string(),
+                        range: None,
+                    },
+                ],
+                diagnostics: Vec::new(),
+            });
+        }
+        let extensions_range = tbs_spans
+            .as_ref()
+            .and_then(|s| s.extensions)
+            .unwrap_or(crl_range);
+        children.push(AnalysisNode {
+            id: NodeId::new(),
+            label: format!("CRL Extensions ({})", extensions.len()),
+            kind: "x509_crl_extensions".into(),
+            range: extensions_range,
+            children: ext_children,
+            fields: Vec::new(),
+            diagnostics: Vec::new(),
+        });
+    }
+
+    // ── Outer Signature ──
+    let sig_algo = oid_name(&crl.signature_algorithm.algorithm.to_id_string());
+    let sig_algo_range = outer_spans.as_ref().map(|s| s.signature_algorithm);
+    let sig_value_range = outer_spans.as_ref().map(|s| s.signature_value);
+    children.push(AnalysisNode {
+        id: NodeId::new(),
+        label: "Signature".into(),
+        kind: "x509_crl_signature".into(),
+        range: sig_value_range.unwrap_or(crl_range),
+        children: Vec::new(),
+        fields: vec![
+            FieldView {
+                name: "Algorithm".into(),
+                value: sig_algo,
+                range: sig_algo_range,
+            },
+            FieldView {
+                name: "Size".into(),
+                value: format!("{} bytes", crl.signature_value.data.len()),
+                range: sig_value_range,
+            },
+        ],
+        diagnostics: Vec::new(),
+    });
+
+    if is_pem {
+        top_diagnostics.push(Diagnostic {
+            severity: Severity::Info,
+            message: "Byte ranges refer to decoded DER content, not PEM text".into(),
+            range: None,
+        });
+    }
+
+    AnalysisNode {
+        id: NodeId::new(),
+        label: label.into(),
+        kind: "x509_crl".into(),
+        range: outer_spans
+            .as_ref()
+            .map(|s| s.certificate)
+            .unwrap_or(crl_range),
+        children,
+        fields: top_fields,
+        diagnostics: top_diagnostics,
     }
 }
 
