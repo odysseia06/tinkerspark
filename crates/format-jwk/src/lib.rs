@@ -6,6 +6,12 @@
 //! - JWS (JSON Web Signature): same compact format as JWT
 //!
 //! Uses `serde_json` for JSON parsing and `base64` for base64url decoding.
+//! Field-level source spans are produced by the in-crate [`json_span`]
+//! scanner so the structure pane can navigate to exact JSON field bytes.
+
+mod json_span;
+
+use std::collections::HashMap;
 
 use tinkerspark_core_analyze::{
     AnalysisNode, AnalysisReport, AnalyzeError, Analyzer, AnalyzerConfidence, FieldView,
@@ -15,6 +21,8 @@ use tinkerspark_core_types::{ByteRange, DetectedKind, Diagnostic, FileHandle, No
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+
+use crate::json_span::FieldSpan;
 
 pub struct JwkAnalyzer;
 
@@ -190,15 +198,25 @@ fn parse_jwt(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
     })
 }
 
-/// Decode a base64url JWT part and extract JSON fields.
+/// Decode a base64url JWT part and extract JSON fields with per-field
+/// source spans relative to the **decoded** JSON buffer.
+///
+/// The node range remains the base64-encoded part's offset in the original
+/// file (so the user can still highlight the encoded chunk in hex), but
+/// individual field ranges land in the decoded buffer because base64 has
+/// no character-level mapping back to the original bytes. The per-node
+/// diagnostic makes that boundary explicit so the structure pane can
+/// communicate it to the user.
 fn decode_jwt_part(raw: &str, label: &str, range: ByteRange) -> Result<AnalysisNode, String> {
     let decoded = URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|e| format!("base64url: {}", e))?;
+    let decoded_text = std::str::from_utf8(&decoded).map_err(|e| format!("UTF-8: {}", e))?;
     let json: serde_json::Value =
-        serde_json::from_slice(&decoded).map_err(|e| format!("JSON: {}", e))?;
+        serde_json::from_str(decoded_text).map_err(|e| format!("JSON: {}", e))?;
 
-    let fields = json_to_fields(&json);
+    let spans = json_span::index_object(decoded_text, 0);
+    let fields = json_to_fields(&json, &spans);
     let kind = format!("jwt_{}", label.to_lowercase());
 
     Ok(AnalysisNode {
@@ -208,11 +226,23 @@ fn decode_jwt_part(raw: &str, label: &str, range: ByteRange) -> Result<AnalysisN
         range,
         children: Vec::new(),
         fields,
-        diagnostics: Vec::new(),
+        diagnostics: vec![Diagnostic {
+            severity: Severity::Info,
+            message: format!(
+                "{} field byte ranges refer to the decoded JSON buffer, not the original \
+                 base64-encoded bytes.",
+                label
+            ),
+            range: None,
+        }],
     })
 }
 
 /// Parse a JWK (JSON Web Key) or JWK Set.
+///
+/// `original_text` is the full file text (with leading/trailing whitespace
+/// preserved) so JSON span ranges are accurate file offsets. The trimmed
+/// text was already used by the caller for `serde_json::from_str` only.
 fn parse_jwk(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> {
     let json: serde_json::Value = serde_json::from_str(text).map_err(|e| AnalyzeError::Parse {
         message: format!("Invalid JSON: {}", e),
@@ -221,12 +251,35 @@ fn parse_jwk(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
     let mut diagnostics = Vec::new();
     let mut root_nodes = Vec::new();
 
+    // Build a single span index over the whole file. The text passed in is
+    // the trimmed file body; trim() only strips leading/trailing whitespace,
+    // and `index_object` skips the same whitespace internally before the
+    // opening `{`, so byte offsets line up with the file when the file
+    // starts at offset 0 and has no leading whitespace. To stay correct
+    // with leading whitespace, we use offset 0 and walk the original text.
+    let outer_index = json_span::index_object(text, 0);
+
     // Check if it's a JWK Set (has "keys" array) or single JWK.
     if let Some(keys) = json.get("keys").and_then(|v| v.as_array()) {
-        // JWK Set
+        // Locate the `keys` array's byte range and walk its elements.
+        let child_ranges = if let Some(keys_span) = outer_index.get("keys") {
+            let array_text = slice_text(text, keys_span.value);
+            let array_offset = keys_span.value.offset();
+            json_span::index_array_objects(array_text, array_offset)
+        } else {
+            Vec::new()
+        };
+
         let mut children = Vec::new();
         for (i, key) in keys.iter().enumerate() {
-            children.push(build_jwk_node(key, i, file_len));
+            let (child_range, child_index) = if let Some(range) = child_ranges.get(i) {
+                let child_text = slice_text(text, *range);
+                let idx = json_span::index_object(child_text, range.offset());
+                (*range, idx)
+            } else {
+                (ByteRange::new(0, file_len), HashMap::new())
+            };
+            children.push(build_jwk_node(key, i, child_range, &child_index));
         }
         root_nodes.push(AnalysisNode {
             id: NodeId::new(),
@@ -237,13 +290,18 @@ fn parse_jwk(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
             fields: vec![FieldView {
                 name: "Key Count".into(),
                 value: keys.len().to_string(),
-                range: None,
+                range: outer_index.get("keys").map(|s| s.value),
             }],
             diagnostics: Vec::new(),
         });
     } else if json.get("kty").is_some() {
-        // Single JWK
-        root_nodes.push(build_jwk_node(&json, 0, file_len));
+        // Single JWK — use the file-wide range as the object range.
+        root_nodes.push(build_jwk_node(
+            &json,
+            0,
+            ByteRange::new(0, file_len),
+            &outer_index,
+        ));
     } else {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
@@ -257,7 +315,7 @@ fn parse_jwk(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
             kind: "json".into(),
             range: ByteRange::new(0, file_len),
             children: Vec::new(),
-            fields: json_to_fields(&json),
+            fields: json_to_fields(&json, &outer_index),
             diagnostics: Vec::new(),
         });
     }
@@ -269,44 +327,64 @@ fn parse_jwk(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
     })
 }
 
+/// Slice a substring out of `text` using a `ByteRange`. Returns an empty
+/// string when the range falls outside the buffer (defensive — span
+/// extraction is best-effort).
+fn slice_text(text: &str, range: ByteRange) -> &str {
+    let start = range.offset() as usize;
+    let end = (range.offset() + range.length()) as usize;
+    text.get(start..end).unwrap_or("")
+}
+
 /// Build an analysis node for a single JWK.
-fn build_jwk_node(key: &serde_json::Value, index: usize, file_len: u64) -> AnalysisNode {
+///
+/// `object_range` is the byte range of this JWK's `{...}` literal in the
+/// source file. `index` maps top-level field names to their key/value byte
+/// ranges within the same coordinate system. Field-view ranges fall back
+/// to `None` when a key is absent from the index (graceful degradation
+/// when span extraction failed).
+fn build_jwk_node(
+    key: &serde_json::Value,
+    index_in_set: usize,
+    object_range: ByteRange,
+    spans: &HashMap<String, FieldSpan>,
+) -> AnalysisNode {
     let kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or("unknown");
     let kid = key.get("kid").and_then(|v| v.as_str()).unwrap_or("");
     let alg = key.get("alg").and_then(|v| v.as_str()).unwrap_or("");
     let use_field = key.get("use").and_then(|v| v.as_str()).unwrap_or("");
 
     let label = if !kid.is_empty() {
-        format!("Key {}: {} (kid={})", index, kty, kid)
+        format!("Key {}: {} (kid={})", index_in_set, kty, kid)
     } else {
-        format!("Key {}: {}", index, kty)
+        format!("Key {}: {}", index_in_set, kty)
     };
 
     let mut fields = vec![FieldView {
         name: "Key Type (kty)".into(),
         value: kty.to_string(),
-        range: None,
+        range: spans.get("kty").map(|s| s.value),
     }];
 
     if !alg.is_empty() {
         fields.push(FieldView {
             name: "Algorithm (alg)".into(),
             value: alg.to_string(),
-            range: None,
+            range: spans.get("alg").map(|s| s.value),
         });
     }
     if !kid.is_empty() {
         fields.push(FieldView {
             name: "Key ID (kid)".into(),
             value: kid.to_string(),
-            range: None,
+            range: spans.get("kid").map(|s| s.value),
         });
     }
     if !use_field.is_empty() {
         fields.push(FieldView {
             name: "Use".into(),
             value: use_field.to_string(),
-            range: None,
+            range: spans.get("use").map(|s| s.value),
         });
     }
 
@@ -317,25 +395,34 @@ fn build_jwk_node(key: &serde_json::Value, index: usize, file_len: u64) -> Analy
                 // Approximate key size from modulus base64url length.
                 let approx_bits = n.len() * 6; // base64url chars * 6 bits
                 fields.push(FieldView {
-                    name: "Modulus size (approx)".into(),
+                    name: "Modulus (n)".into(),
                     value: format!("~{} bits", approx_bits),
-                    range: None,
+                    range: spans.get("n").map(|s| s.value),
                 });
             }
             if let Some(e) = key.get("e").and_then(|v| v.as_str()) {
                 fields.push(FieldView {
                     name: "Exponent (e)".into(),
                     value: e.to_string(),
-                    range: None,
+                    range: spans.get("e").map(|s| s.value),
                 });
             }
             // Check for private key components.
             if key.get("d").is_some() {
                 fields.push(FieldView {
-                    name: "Private key".into(),
-                    value: "Present (d, p, q, dp, dq, qi)".into(),
-                    range: None,
+                    name: "Private exponent (d)".into(),
+                    value: "Present".into(),
+                    range: spans.get("d").map(|s| s.value),
                 });
+            }
+            for component in &["p", "q", "dp", "dq", "qi"] {
+                if key.get(*component).is_some() {
+                    fields.push(FieldView {
+                        name: format!("RSA private ({component})"),
+                        value: "Present".into(),
+                        range: spans.get(*component).map(|s| s.value),
+                    });
+                }
             }
         }
         "EC" => {
@@ -343,14 +430,28 @@ fn build_jwk_node(key: &serde_json::Value, index: usize, file_len: u64) -> Analy
                 fields.push(FieldView {
                     name: "Curve (crv)".into(),
                     value: crv.to_string(),
-                    range: None,
+                    range: spans.get("crv").map(|s| s.value),
+                });
+            }
+            if key.get("x").is_some() {
+                fields.push(FieldView {
+                    name: "Point x".into(),
+                    value: "Present".into(),
+                    range: spans.get("x").map(|s| s.value),
+                });
+            }
+            if key.get("y").is_some() {
+                fields.push(FieldView {
+                    name: "Point y".into(),
+                    value: "Present".into(),
+                    range: spans.get("y").map(|s| s.value),
                 });
             }
             if key.get("d").is_some() {
                 fields.push(FieldView {
-                    name: "Private key".into(),
-                    value: "Present (d)".into(),
-                    range: None,
+                    name: "Private scalar (d)".into(),
+                    value: "Present".into(),
+                    range: spans.get("d").map(|s| s.value),
                 });
             }
         }
@@ -359,14 +460,21 @@ fn build_jwk_node(key: &serde_json::Value, index: usize, file_len: u64) -> Analy
                 fields.push(FieldView {
                     name: "Curve (crv)".into(),
                     value: crv.to_string(),
-                    range: None,
+                    range: spans.get("crv").map(|s| s.value),
+                });
+            }
+            if key.get("x").is_some() {
+                fields.push(FieldView {
+                    name: "Public key (x)".into(),
+                    value: "Present".into(),
+                    range: spans.get("x").map(|s| s.value),
                 });
             }
             if key.get("d").is_some() {
                 fields.push(FieldView {
-                    name: "Private key".into(),
-                    value: "Present (d)".into(),
-                    range: None,
+                    name: "Private key (d)".into(),
+                    value: "Present".into(),
+                    range: spans.get("d").map(|s| s.value),
                 });
             }
         }
@@ -374,9 +482,9 @@ fn build_jwk_node(key: &serde_json::Value, index: usize, file_len: u64) -> Analy
             if let Some(k) = key.get("k").and_then(|v| v.as_str()) {
                 let approx_bits = k.len() * 6;
                 fields.push(FieldView {
-                    name: "Key size (approx)".into(),
+                    name: "Symmetric key (k)".into(),
                     value: format!("~{} bits", approx_bits),
-                    range: None,
+                    range: spans.get("k").map(|s| s.value),
                 });
             }
         }
@@ -390,29 +498,25 @@ fn build_jwk_node(key: &serde_json::Value, index: usize, file_len: u64) -> Analy
             fields.push(FieldView {
                 name: "Key Operations".into(),
                 value: ops_str.join(", "),
-                range: None,
+                range: spans.get("key_ops").map(|s| s.value),
             });
         }
     }
-
-    // NOTE: Byte-range mapping for individual JSON fields within the file
-    // requires a JSON parser that tracks source spans. This is a follow-up
-    // improvement. Currently, the whole-file/object range is used.
-    // TODO: Add span-tracking JSON parser for field-level byte ranges.
 
     AnalysisNode {
         id: NodeId::new(),
         label,
         kind: "jwk".into(),
-        range: ByteRange::new(0, file_len),
+        range: object_range,
         children: Vec::new(),
         fields,
         diagnostics: Vec::new(),
     }
 }
 
-/// Convert JSON object fields to FieldView list.
-fn json_to_fields(json: &serde_json::Value) -> Vec<FieldView> {
+/// Convert JSON object fields to FieldView list, attaching the span
+/// index's per-field byte ranges where available.
+fn json_to_fields(json: &serde_json::Value, spans: &HashMap<String, FieldSpan>) -> Vec<FieldView> {
     let obj = match json.as_object() {
         Some(o) => o,
         None => return Vec::new(),
@@ -431,7 +535,7 @@ fn json_to_fields(json: &serde_json::Value) -> Vec<FieldView> {
             FieldView {
                 name: k.clone(),
                 value,
-                range: None, // TODO: span-tracking for byte ranges
+                range: spans.get(k).map(|s| s.value),
             }
         })
         .collect()
@@ -499,6 +603,203 @@ mod tests {
         let root = &report.root_nodes[0];
         assert!(root.label.contains("JWK Set"));
         assert_eq!(root.children.len(), 1);
+    }
+
+    fn slice_text<'a>(text: &'a str, range: ByteRange) -> &'a str {
+        let start = range.offset() as usize;
+        let end = (range.offset() + range.length()) as usize;
+        &text[start..end]
+    }
+
+    #[test]
+    fn jwk_field_ranges_point_at_source_substrings() {
+        let jwk = r#"{"kty":"RSA","n":"abc","e":"AQAB","kid":"k1","alg":"RS256","use":"sig"}"#;
+        let report = parse_jwk(jwk, jwk.len() as u64).unwrap();
+        let node = &report.root_nodes[0];
+
+        let parent = node.range;
+        let cases: &[(&str, &str)] = &[
+            ("Key Type (kty)", "\"RSA\""),
+            ("Modulus (n)", "\"abc\""),
+            ("Exponent (e)", "\"AQAB\""),
+            ("Key ID (kid)", "\"k1\""),
+            ("Algorithm (alg)", "\"RS256\""),
+            ("Use", "\"sig\""),
+        ];
+
+        for (field_name, expected) in cases {
+            let field = node
+                .fields
+                .iter()
+                .find(|f| f.name == *field_name)
+                .unwrap_or_else(|| panic!("missing field {field_name}"));
+            let range = field
+                .range
+                .unwrap_or_else(|| panic!("field {field_name} has no range"));
+            assert!(
+                range.length() > 0,
+                "field {field_name} should have non-empty range"
+            );
+            assert_eq!(
+                slice_text(jwk, range),
+                *expected,
+                "field {field_name} range should slice the expected source substring"
+            );
+            assert!(
+                range.offset() >= parent.offset() && range.end() <= parent.end(),
+                "field {field_name} range must be nested inside the parent JWK object"
+            );
+        }
+    }
+
+    #[test]
+    fn jwk_set_children_have_distinct_sub_ranges_with_field_spans() {
+        let jwks =
+            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"AAA","y":"BBB"},{"kty":"oct","k":"CCC"}]}"#;
+        let report = parse_jwk(jwks, jwks.len() as u64).unwrap();
+        let set = &report.root_nodes[0];
+        assert_eq!(set.kind, "jwk_set");
+        assert_eq!(set.children.len(), 2);
+
+        // Each child's range must be a strict sub-range of the set, and
+        // the two children must have distinct ranges.
+        let mut offsets: Vec<u64> = set.children.iter().map(|c| c.range.offset()).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 2);
+        for child in &set.children {
+            assert!(child.range.length() < set.range.length());
+            assert!(child.range.offset() >= set.range.offset());
+            assert!(child.range.end() <= set.range.end());
+        }
+
+        // Field ranges on each child must slice their expected substrings
+        // from the original source, AND must be nested inside the child
+        // object's range — proving the per-child sub-index is wired
+        // correctly, not the outer-set index.
+        let ec = &set.children[0];
+        let crv_range = ec
+            .fields
+            .iter()
+            .find(|f| f.name == "Curve (crv)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(jwks, crv_range), "\"P-256\"");
+        assert!(crv_range.offset() >= ec.range.offset());
+        assert!(crv_range.end() <= ec.range.end());
+
+        let oct = &set.children[1];
+        let k_range = oct
+            .fields
+            .iter()
+            .find(|f| f.name == "Symmetric key (k)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(jwks, k_range), "\"CCC\"");
+        assert!(k_range.offset() >= oct.range.offset());
+        assert!(k_range.end() <= oct.range.end());
+
+        // The kty field on each child should also point at its own kty,
+        // not at the outer object's first kty.
+        let ec_kty = ec
+            .fields
+            .iter()
+            .find(|f| f.name == "Key Type (kty)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(jwks, ec_kty), "\"EC\"");
+        let oct_kty = oct
+            .fields
+            .iter()
+            .find(|f| f.name == "Key Type (kty)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(jwks, oct_kty), "\"oct\"");
+        assert_ne!(ec_kty.offset(), oct_kty.offset());
+    }
+
+    #[test]
+    fn jwk_field_ranges_survive_pretty_printed_input() {
+        let jwk = "{\n  \"kty\" : \"RSA\" ,\n  \"e\"   : \"AQAB\"\n}";
+        let report = parse_jwk(jwk, jwk.len() as u64).unwrap();
+        let node = &report.root_nodes[0];
+        let kty_range = node
+            .fields
+            .iter()
+            .find(|f| f.name == "Key Type (kty)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(jwk, kty_range), "\"RSA\"");
+        let e_range = node
+            .fields
+            .iter()
+            .find(|f| f.name == "Exponent (e)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(jwk, e_range), "\"AQAB\"");
+    }
+
+    #[test]
+    fn jwt_header_and_payload_carry_decoded_field_ranges_with_diagnostic() {
+        // {"alg":"HS256","typ":"JWT"}.{"sub":"1234567890","name":"John Doe","iat":1516239022}.sig
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+                    eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.\
+                    SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let report = parse_jwt(jwt, jwt.len() as u64).unwrap();
+        let root = &report.root_nodes[0];
+
+        // Locate the header node and verify its alg field has a range
+        // (decoded-relative) that slices `"HS256"` out of the decoded JSON.
+        let header = root
+            .children
+            .iter()
+            .find(|c| c.kind == "jwt_header")
+            .unwrap();
+        let alg_field = header.fields.iter().find(|f| f.name == "alg").unwrap();
+        let alg_range = alg_field.range.expect("alg should carry a decoded range");
+        let decoded_header = URL_SAFE_NO_PAD
+            .decode("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9")
+            .unwrap();
+        let decoded_text = std::str::from_utf8(&decoded_header).unwrap();
+        assert_eq!(slice_text(decoded_text, alg_range), "\"HS256\"");
+        assert!(alg_range.length() > 0);
+
+        // The header node must carry the decoded-buffer disclaimer
+        // diagnostic so the UI knows the field ranges aren't file offsets.
+        assert!(
+            header
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("decoded JSON buffer")),
+            "expected decoded-buffer diagnostic on header node"
+        );
+
+        // Same shape for payload.
+        let payload = root
+            .children
+            .iter()
+            .find(|c| c.kind == "jwt_payload")
+            .unwrap();
+        let sub_field = payload.fields.iter().find(|f| f.name == "sub").unwrap();
+        let sub_range = sub_field.range.expect("sub should carry a decoded range");
+        let decoded_payload = URL_SAFE_NO_PAD
+            .decode("eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ")
+            .unwrap();
+        let decoded_payload_text = std::str::from_utf8(&decoded_payload).unwrap();
+        assert_eq!(
+            slice_text(decoded_payload_text, sub_range),
+            "\"1234567890\""
+        );
+        assert!(payload
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("decoded JSON buffer")));
     }
 
     #[test]
