@@ -487,11 +487,11 @@ mod tests {
 
     #[test]
     fn utf8_truncation_at_multibyte_boundary_does_not_panic() {
-        // 64 ASCII bytes followed by two 3-byte UTF-8 chars (e.g. 'あ' = E3 81 82).
-        // Total: 64 + 6 = 70 bytes, 66 chars → triggers truncation at 64 chars.
-        // The old &text[..64] by byte index would have landed inside a multibyte
-        // sequence and panicked. The fix uses char-based truncation.
-        let mut data = vec![b'A'; 64];
+        // 63 ASCII bytes followed by two 3-byte UTF-8 chars (e.g. 'あ' = E3 81 82).
+        // Total: 63 + 6 = 69 bytes, 65 chars → triggers truncation at 64 chars.
+        // Byte index 64 falls inside the first 'あ' (byte 63 is the last ASCII
+        // byte, bytes 63..66 are E3 81 82). The old &text[..64] would panic here.
+        let mut data = vec![b'A'; 63];
         data.extend_from_slice("ああ".as_bytes()); // 6 bytes, 2 chars
         let template = make_template(
             vec![FieldDef {
