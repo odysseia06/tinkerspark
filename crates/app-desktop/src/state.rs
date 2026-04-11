@@ -611,6 +611,13 @@ impl AppState {
         };
         let is_armored = analysis.as_ref().is_some_and(|a| a.armored);
         if let Some(a) = analysis {
+            let already_selected = a.selected_node == Some(node_id)
+                && a.selected_range == Some(range);
+            if already_selected {
+                a.selected_node = None;
+                a.selected_range = None;
+                return;
+            }
             a.selected_node = Some(node_id);
             a.selected_range = if is_armored { None } else { Some(range) };
         }
