@@ -14,6 +14,7 @@ members = [
     "crates/format-ssh",
     "crates/format-age",
     "crates/format-jwk",
+    "crates/format-custom",
     "crates/infra-io",
     "crates/infra-session",
 ]
@@ -37,6 +38,7 @@ tinkerspark-format-x509 = { path = "crates/format-x509" }
 tinkerspark-format-ssh = { path = "crates/format-ssh" }
 tinkerspark-format-age = { path = "crates/format-age" }
 tinkerspark-format-jwk = { path = "crates/format-jwk" }
+tinkerspark-format-custom = { path = "crates/format-custom" }
 tinkerspark-infra-io = { path = "crates/infra-io" }
 tinkerspark-infra-session = { path = "crates/infra-session" }
 

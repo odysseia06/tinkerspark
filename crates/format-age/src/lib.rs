@@ -14,7 +14,7 @@ use tinkerspark_core_types::{ByteRange, DetectedKind, Diagnostic, FileHandle, No
 pub struct AgeAnalyzer;
 
 impl Analyzer for AgeAnalyzer {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "age"
     }
 

@@ -27,7 +27,7 @@ use crate::json_span::FieldSpan;
 pub struct JwkAnalyzer;
 
 impl Analyzer for JwkAnalyzer {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "jwk"
     }
 

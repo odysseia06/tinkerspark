@@ -48,7 +48,7 @@ impl X509Kind {
 }
 
 impl Analyzer for X509Analyzer {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "x509"
     }
 

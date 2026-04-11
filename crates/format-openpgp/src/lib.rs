@@ -20,7 +20,7 @@ use tinkerspark_core_types::{ByteRange, DetectedKind, Diagnostic, FileHandle, No
 pub struct OpenPgpAnalyzer;
 
 impl Analyzer for OpenPgpAnalyzer {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "openpgp"
     }
 

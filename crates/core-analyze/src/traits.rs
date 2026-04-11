@@ -23,7 +23,7 @@ pub enum AnalyzerConfidence {
 /// `AnalysisNode`s with byte ranges that map back to the raw file.
 pub trait Analyzer: Send + Sync {
     /// Unique identifier for this analyzer (e.g., "openpgp").
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
 
     /// Sniff whether this analyzer can handle the given file.
     ///

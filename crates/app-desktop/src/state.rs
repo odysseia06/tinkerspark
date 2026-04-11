@@ -754,6 +754,11 @@ fn build_registry(generic_sensitivity: Sensitivity) -> AnalyzerRegistry {
     registry.register(Box::new(tinkerspark_format_ssh::SshAnalyzer));
     registry.register(Box::new(tinkerspark_format_age::AgeAnalyzer));
     registry.register(Box::new(tinkerspark_format_jwk::JwkAnalyzer));
+    for template in tinkerspark_format_custom::load_templates() {
+        registry.register(Box::new(tinkerspark_format_custom::CustomAnalyzer::new(
+            template,
+        )));
+    }
     registry.register(Box::new(
         tinkerspark_format_generic::GenericAnalyzer::with_mode(generic_sensitivity),
     ));

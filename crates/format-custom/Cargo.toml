@@ -1,0 +1,20 @@
+[package]
+name = "tinkerspark-format-custom"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/format_custom.rs"
+
+[dependencies]
+tinkerspark-core-types = { workspace = true }
+tinkerspark-core-bytes = { workspace = true }
+tinkerspark-core-analyze = { workspace = true }
+serde = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }
+dirs = "6"
+
+[dev-dependencies]
+tempfile = { workspace = true }

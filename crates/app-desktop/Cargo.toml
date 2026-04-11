@@ -17,6 +17,7 @@ tinkerspark-format-x509 = { workspace = true }
 tinkerspark-format-ssh = { workspace = true }
 tinkerspark-format-age = { workspace = true }
 tinkerspark-format-jwk = { workspace = true }
+tinkerspark-format-custom = { workspace = true }
 tinkerspark-infra-io = { workspace = true }
 tinkerspark-infra-session = { workspace = true }
 eframe = { workspace = true }

@@ -164,7 +164,7 @@ impl GenericAnalyzer {
 }
 
 impl Analyzer for GenericAnalyzer {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "generic"
     }
 

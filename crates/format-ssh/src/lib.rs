@@ -15,7 +15,7 @@ use tinkerspark_core_types::{ByteRange, DetectedKind, Diagnostic, FileHandle, No
 pub struct SshAnalyzer;
 
 impl Analyzer for SshAnalyzer {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "ssh"
     }
 
