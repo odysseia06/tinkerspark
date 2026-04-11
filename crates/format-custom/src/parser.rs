@@ -267,8 +267,10 @@ fn format_value(bytes: &[u8], field: &FieldDef, endian: Endian) -> (String, Opti
         }
         FieldType::Utf8 => {
             let text = String::from_utf8_lossy(bytes);
-            let truncated = if text.len() > 64 {
-                format!("{}...", &text[..64])
+            let truncated = if text.chars().count() > 64 {
+                let mut s: String = text.chars().take(64).collect();
+                s.push_str("...");
+                s
             } else {
                 text.into_owned()
             };
@@ -481,6 +483,31 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(!nodes[0].diagnostics.is_empty());
         assert!(nodes[0].diagnostics[0].message.contains("invalid UTF-8"));
+    }
+
+    #[test]
+    fn utf8_truncation_at_multibyte_boundary_does_not_panic() {
+        // 64 ASCII bytes followed by two 3-byte UTF-8 chars (e.g. 'あ' = E3 81 82).
+        // Total: 64 + 6 = 70 bytes, 66 chars → triggers truncation at 64 chars.
+        // The old &text[..64] by byte index would have landed inside a multibyte
+        // sequence and panicked. The fix uses char-based truncation.
+        let mut data = vec![b'A'; 64];
+        data.extend_from_slice("ああ".as_bytes()); // 6 bytes, 2 chars
+        let template = make_template(
+            vec![FieldDef {
+                name: "Text".into(),
+                r#type: FieldType::Utf8,
+                size: Some(data.len() as u64),
+                size_from: None,
+                known_values: HashMap::new(),
+            }],
+            Endian::Big,
+        );
+        let src = MemoryByteSource::new(data);
+        let (nodes, _) = parse(&template, &src);
+        assert_eq!(nodes.len(), 1);
+        let value = &nodes[0].fields[0].value;
+        assert!(value.ends_with("..."), "value: {value}");
     }
 
     #[test]

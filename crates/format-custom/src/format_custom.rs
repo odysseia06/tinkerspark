@@ -44,10 +44,6 @@ impl Analyzer for CustomAnalyzer {
         if extension_matches(&self.template.file.r#match.extensions, handle) {
             return AnalyzerConfidence::Low;
         }
-        // Template with no match rules is a universal fallback.
-        if !has_magic && self.template.file.r#match.extensions.is_empty() {
-            return AnalyzerConfidence::Low;
-        }
         AnalyzerConfidence::None
     }
 
@@ -160,14 +156,27 @@ pub fn load_templates_from(dir: &Path) -> Vec<ValidatedTemplate> {
         Ok(rd) => rd,
         Err(_) => return Vec::new(),
     };
+
+    // Collect and sort paths for deterministic load order across platforms.
+    let mut paths: Vec<_> = read_dir
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .collect();
+    paths.sort();
+
     let mut templates = Vec::new();
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
-        match load_one(&path) {
+    for path in &paths {
+        match load_one(path) {
             Ok(t) => {
+                if !t.has_match_rules() {
+                    tracing::warn!(
+                        template = %t.file.template.name,
+                        path = %path.display(),
+                        "skipping template with no match rules (add [match] magic or extensions)"
+                    );
+                    continue;
+                }
                 tracing::info!(
                     template = %t.file.template.name,
                     path = %path.display(),
@@ -314,19 +323,23 @@ type = "u8"
     }
 
     #[test]
-    fn can_analyze_no_rules_matches_everything() {
+    fn can_analyze_no_rules_returns_none() {
         let file: template::TemplateFile = toml::from_str(
             r#"
 [template]
-name = "Universal"
+name = "NoRules"
 "#,
         )
         .unwrap();
         let template = template::validate(file).unwrap();
+        assert!(!template.has_match_rules());
         let analyzer = CustomAnalyzer::new(template);
         let src = MemoryByteSource::new(vec![0x01]);
         let handle = make_handle("anything");
-        assert_eq!(analyzer.can_analyze(&handle, &src), AnalyzerConfidence::Low);
+        assert_eq!(
+            analyzer.can_analyze(&handle, &src),
+            AnalyzerConfidence::None
+        );
     }
 
     #[test]
@@ -397,12 +410,14 @@ name = "Universal"
     #[test]
     fn load_templates_from_mixed_dir() {
         let dir = tempfile::tempdir().unwrap();
-        // Valid template
+        // Valid template with match rules
         std::fs::write(
             dir.path().join("good.toml"),
             r#"
 [template]
 name = "Good"
+[match]
+extensions = ["goo"]
 [[fields]]
 name = "Tag"
 type = "u8"
@@ -424,6 +439,53 @@ name = ""
         let templates = load_templates_from(dir.path());
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].file.template.name, "Good");
+    }
+
+    #[test]
+    fn load_templates_rejects_no_match_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("universal.toml"),
+            r#"
+[template]
+name = "Universal"
+[[fields]]
+name = "Tag"
+type = "u8"
+"#,
+        )
+        .unwrap();
+        let templates = load_templates_from(dir.path());
+        assert!(templates.is_empty());
+    }
+
+    #[test]
+    fn load_templates_sorted_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("z_format.toml"),
+            r#"
+[template]
+name = "Zeta"
+[match]
+extensions = ["z"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a_format.toml"),
+            r#"
+[template]
+name = "Alpha"
+[match]
+extensions = ["a"]
+"#,
+        )
+        .unwrap();
+        let templates = load_templates_from(dir.path());
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].file.template.name, "Alpha");
+        assert_eq!(templates[1].file.template.name, "Zeta");
     }
 
     #[test]

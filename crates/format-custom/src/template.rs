@@ -94,6 +94,15 @@ pub struct ValidatedTemplate {
     pub parsed_magic: Vec<(u64, Vec<u8>)>,
 }
 
+impl ValidatedTemplate {
+    /// Whether this template has at least one match rule (magic or extension).
+    /// Templates without rules cannot identify which files they apply to and
+    /// are rejected by the auto-loader to prevent accidental universal fallback.
+    pub fn has_match_rules(&self) -> bool {
+        !self.parsed_magic.is_empty() || !self.file.r#match.extensions.is_empty()
+    }
+}
+
 /// Parse a hex string like `"AB CD EF"` or `"ABCDEF"` into bytes.
 fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>, ValidationError> {
     let cleaned: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
