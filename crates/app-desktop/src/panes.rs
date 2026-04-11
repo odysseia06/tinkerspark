@@ -294,20 +294,8 @@ fn render_structure_pane(ui: &mut Ui, state: &mut AppState) {
             }
         });
 
-    // Apply selection — use direct field access for split borrows.
     if let Some((node_id, range)) = clicked_node {
-        if let Some(crate::state::WorkspaceTab::File { file, analysis }) =
-            state.tabs.get_mut(state.active_tab)
-        {
-            let is_armored = analysis.as_ref().is_some_and(|a| a.armored);
-            if let Some(a) = analysis {
-                a.selected_node = Some(node_id);
-                a.selected_range = if is_armored { None } else { Some(range) };
-            }
-            if !is_armored {
-                file.hex.jump_to(range.offset());
-            }
-        }
+        state.apply_structure_click(node_id, range);
     }
 }
 
@@ -345,7 +333,18 @@ fn render_analysis_node(
                     .show(ui, |ui| {
                         for field in &node.fields {
                             ui.label(egui::RichText::new(&field.name).color(egui::Color32::GRAY));
-                            ui.label(&field.value);
+                            // Fields with a byte range become clickable: a
+                            // click feeds (parent_node_id, field.range) into
+                            // the same dispatch as a node click, so the hex
+                            // view jumps to the exact field bytes.
+                            if let Some(range) = field.range {
+                                let resp = ui.selectable_label(false, &field.value);
+                                if resp.clicked() {
+                                    *clicked = Some((node.id, range));
+                                }
+                            } else {
+                                ui.label(&field.value);
+                            }
                             ui.end_row();
                         }
                     });

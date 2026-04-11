@@ -46,12 +46,15 @@ impl Analyzer for JwkAnalyzer {
     ) -> Result<AnalysisReport, AnalyzeError> {
         let file_len = src.len();
         let data = src.read_range(ByteRange::new(0, file_len))?;
+        // The full file text, NOT trimmed. The span-tracking parsers want
+        // real file offsets, so trimming would shift every emitted byte
+        // range by the leading-whitespace length. The parsers handle their
+        // own whitespace skipping internally.
         let text = String::from_utf8_lossy(&data);
-        let text = text.trim();
 
         match &handle.kind {
-            DetectedKind::JsonWebToken => parse_jwt(text, file_len),
-            DetectedKind::JsonWebKey => parse_jwk(text, file_len),
+            DetectedKind::JsonWebToken => parse_jwt(&text, file_len),
+            DetectedKind::JsonWebKey => parse_jwk(&text, file_len),
             _ => Err(AnalyzeError::Unsupported),
         }
     }
@@ -59,7 +62,13 @@ impl Analyzer for JwkAnalyzer {
 
 /// Parse a JWT/JWS in compact serialization: header.payload.signature
 fn parse_jwt(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> {
-    let parts: Vec<&str> = text.splitn(4, '.').collect();
+    // Find where the JWT body actually starts in the file. Leading and
+    // trailing whitespace must not shift the part offsets — we still want
+    // them to be real file positions.
+    let leading_ws = text.len() - text.trim_start().len();
+    let body = text[leading_ws..].trim_end();
+
+    let parts: Vec<&str> = body.splitn(4, '.').collect();
     if parts.len() < 3 {
         return Err(AnalyzeError::Parse {
             message: format!("Expected 3 dot-separated parts, found {}", parts.len()),
@@ -69,8 +78,9 @@ fn parse_jwt(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
     let mut diagnostics = Vec::new();
     let mut children = Vec::new();
 
-    // Track byte offsets for each part.
-    let mut offset = 0u64;
+    // Byte offsets are file offsets, anchored at the first non-whitespace
+    // byte of the file (so a leading newline or BOM doesn't shift them).
+    let mut offset = leading_ws as u64;
 
     // ── Header ──
     let header_raw = parts[0];
@@ -198,25 +208,27 @@ fn parse_jwt(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
     })
 }
 
-/// Decode a base64url JWT part and extract JSON fields with per-field
-/// source spans relative to the **decoded** JSON buffer.
+/// Decode a base64url JWT part and extract JSON field values for display.
 ///
-/// The node range remains the base64-encoded part's offset in the original
-/// file (so the user can still highlight the encoded chunk in hex), but
-/// individual field ranges land in the decoded buffer because base64 has
-/// no character-level mapping back to the original bytes. The per-node
-/// diagnostic makes that boundary explicit so the structure pane can
-/// communicate it to the user.
+/// JWT field ranges are intentionally **not** populated: base64 has no
+/// character-level mapping back to the source file, so any range we
+/// emitted would either be a wrong file offset (confusing the structure
+/// pane) or a decoded-buffer offset (a different coordinate system that
+/// `FieldView::range` doesn't model). The encoded part itself still has
+/// a real file range on the parent node, which is the only granularity
+/// `FieldView::range` can carry coherently. See issue #5 for the
+/// "where source mapping is still meaningful" hedge that lets us punt on
+/// per-field JWT navigation until a typed coordinate space exists.
 fn decode_jwt_part(raw: &str, label: &str, range: ByteRange) -> Result<AnalysisNode, String> {
     let decoded = URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|e| format!("base64url: {}", e))?;
-    let decoded_text = std::str::from_utf8(&decoded).map_err(|e| format!("UTF-8: {}", e))?;
     let json: serde_json::Value =
-        serde_json::from_str(decoded_text).map_err(|e| format!("JSON: {}", e))?;
+        serde_json::from_slice(&decoded).map_err(|e| format!("JSON: {}", e))?;
 
-    let spans = json_span::index_object(decoded_text, 0);
-    let fields = json_to_fields(&json, &spans);
+    // Empty span map → every FieldView keeps `range: None`.
+    let no_spans = HashMap::new();
+    let fields = json_to_fields(&json, &no_spans);
     let kind = format!("jwt_{}", label.to_lowercase());
 
     Ok(AnalysisNode {
@@ -226,23 +238,16 @@ fn decode_jwt_part(raw: &str, label: &str, range: ByteRange) -> Result<AnalysisN
         range,
         children: Vec::new(),
         fields,
-        diagnostics: vec![Diagnostic {
-            severity: Severity::Info,
-            message: format!(
-                "{} field byte ranges refer to the decoded JSON buffer, not the original \
-                 base64-encoded bytes.",
-                label
-            ),
-            range: None,
-        }],
+        diagnostics: Vec::new(),
     })
 }
 
 /// Parse a JWK (JSON Web Key) or JWK Set.
 ///
-/// `original_text` is the full file text (with leading/trailing whitespace
-/// preserved) so JSON span ranges are accurate file offsets. The trimmed
-/// text was already used by the caller for `serde_json::from_str` only.
+/// `text` is the **full** file text — leading/trailing whitespace
+/// preserved — so the span scanner can emit real file offsets. `serde_json`
+/// tolerates surrounding whitespace and `index_object` skips it before the
+/// opening `{`, so both layers see the same byte coordinate system.
 fn parse_jwk(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> {
     let json: serde_json::Value = serde_json::from_str(text).map_err(|e| AnalyzeError::Parse {
         message: format!("Invalid JSON: {}", e),
@@ -251,12 +256,10 @@ fn parse_jwk(text: &str, file_len: u64) -> Result<AnalysisReport, AnalyzeError> 
     let mut diagnostics = Vec::new();
     let mut root_nodes = Vec::new();
 
-    // Build a single span index over the whole file. The text passed in is
-    // the trimmed file body; trim() only strips leading/trailing whitespace,
-    // and `index_object` skips the same whitespace internally before the
-    // opening `{`, so byte offsets line up with the file when the file
-    // starts at offset 0 and has no leading whitespace. To stay correct
-    // with leading whitespace, we use offset 0 and walk the original text.
+    // The span scanner walks the same buffer the parser saw and skips
+    // leading whitespace itself, so the returned ranges are absolute file
+    // positions even when the file starts with a BOM, newline, or stray
+    // padding before the opening `{`.
     let outer_index = json_span::index_object(text, 0);
 
     // Check if it's a JWK Set (has "keys" array) or single JWK.
@@ -746,60 +749,147 @@ mod tests {
     }
 
     #[test]
-    fn jwt_header_and_payload_carry_decoded_field_ranges_with_diagnostic() {
-        // {"alg":"HS256","typ":"JWT"}.{"sub":"1234567890","name":"John Doe","iat":1516239022}.sig
+    fn jwt_field_ranges_are_not_emitted_to_avoid_coordinate_space_drift() {
+        // Issue #5 originally added decoded-buffer field ranges, but base64
+        // has no character-level mapping back to the file, and FieldView
+        // uses a single unmarked ByteRange. To keep the model coherent we
+        // intentionally leave per-field JWT ranges empty until a typed
+        // coordinate space exists. The encoded part still has a file range
+        // on its own AnalysisNode, which IS valid file offsets.
         let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
                     eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.\
                     SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         let report = parse_jwt(jwt, jwt.len() as u64).unwrap();
         let root = &report.root_nodes[0];
 
-        // Locate the header node and verify its alg field has a range
-        // (decoded-relative) that slices `"HS256"` out of the decoded JSON.
         let header = root
             .children
             .iter()
             .find(|c| c.kind == "jwt_header")
             .unwrap();
-        let alg_field = header.fields.iter().find(|f| f.name == "alg").unwrap();
-        let alg_range = alg_field.range.expect("alg should carry a decoded range");
-        let decoded_header = URL_SAFE_NO_PAD
-            .decode("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9")
-            .unwrap();
-        let decoded_text = std::str::from_utf8(&decoded_header).unwrap();
-        assert_eq!(slice_text(decoded_text, alg_range), "\"HS256\"");
-        assert!(alg_range.length() > 0);
+        // The header node range is a real file offset.
+        assert!(header.range.length() > 0);
+        // But each header field range is None — no coordinate-space mixing.
+        for field in &header.fields {
+            assert!(
+                field.range.is_none(),
+                "JWT header field {:?} unexpectedly carries a range",
+                field.name
+            );
+        }
 
-        // The header node must carry the decoded-buffer disclaimer
-        // diagnostic so the UI knows the field ranges aren't file offsets.
-        assert!(
-            header
-                .diagnostics
-                .iter()
-                .any(|d| d.message.contains("decoded JSON buffer")),
-            "expected decoded-buffer diagnostic on header node"
-        );
-
-        // Same shape for payload.
         let payload = root
             .children
             .iter()
             .find(|c| c.kind == "jwt_payload")
             .unwrap();
-        let sub_field = payload.fields.iter().find(|f| f.name == "sub").unwrap();
-        let sub_range = sub_field.range.expect("sub should carry a decoded range");
-        let decoded_payload = URL_SAFE_NO_PAD
-            .decode("eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ")
-            .unwrap();
-        let decoded_payload_text = std::str::from_utf8(&decoded_payload).unwrap();
-        assert_eq!(
-            slice_text(decoded_payload_text, sub_range),
-            "\"1234567890\""
-        );
-        assert!(payload
-            .diagnostics
+        for field in &payload.fields {
+            assert!(field.range.is_none());
+        }
+    }
+
+    #[test]
+    fn jwk_field_ranges_survive_leading_file_whitespace() {
+        // The reviewer's regression: a file that starts with whitespace
+        // (BOM, leading newline, indented JSON) must not shift the field
+        // offsets. The span scanner should still report real file offsets.
+        let prefix = "\n  \t";
+        let body = r#"{"kty":"RSA","n":"abc","e":"AQAB"}"#;
+        let mut full = String::new();
+        full.push_str(prefix);
+        full.push_str(body);
+
+        let report = parse_jwk(&full, full.len() as u64).unwrap();
+        let node = &report.root_nodes[0];
+        // The node range now spans the whole file (parent),
+        // and field ranges fall inside it AND slice the right substrings.
+        let kty_range = node
+            .fields
             .iter()
-            .any(|d| d.message.contains("decoded JSON buffer")));
+            .find(|f| f.name == "Key Type (kty)")
+            .unwrap()
+            .range
+            .expect("kty should still have a span when the file has leading ws");
+        assert_eq!(slice_text(&full, kty_range), "\"RSA\"");
+        assert!(kty_range.offset() > prefix.len() as u64 - 1);
+
+        let n_range = node
+            .fields
+            .iter()
+            .find(|f| f.name == "Modulus (n)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(&full, n_range), "\"abc\"");
+    }
+
+    #[test]
+    fn jwk_set_child_ranges_survive_leading_file_whitespace() {
+        let prefix = "\n\n  \t";
+        let body = r#"{"keys":[{"kty":"EC","crv":"P-256"},{"kty":"oct","k":"CCC"}]}"#;
+        let mut full = String::new();
+        full.push_str(prefix);
+        full.push_str(body);
+
+        let report = parse_jwk(&full, full.len() as u64).unwrap();
+        let set = &report.root_nodes[0];
+        assert_eq!(set.children.len(), 2);
+
+        // Each child's range should still slice its real {...} object out
+        // of the original (whitespace-prefixed) source.
+        let ec = &set.children[0];
+        assert_eq!(slice_text(&full, ec.range), r#"{"kty":"EC","crv":"P-256"}"#);
+        let oct = &set.children[1];
+        assert_eq!(slice_text(&full, oct.range), r#"{"kty":"oct","k":"CCC"}"#);
+
+        // And per-child field spans must point at THAT child's bytes inside
+        // the whitespace-shifted source.
+        let crv_range = ec
+            .fields
+            .iter()
+            .find(|f| f.name == "Curve (crv)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(&full, crv_range), "\"P-256\"");
+        let k_range = oct
+            .fields
+            .iter()
+            .find(|f| f.name == "Symmetric key (k)")
+            .unwrap()
+            .range
+            .unwrap();
+        assert_eq!(slice_text(&full, k_range), "\"CCC\"");
+    }
+
+    #[test]
+    fn jwt_part_ranges_survive_leading_file_whitespace() {
+        let jwt = "  \neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig\n";
+        let report = parse_jwt(jwt, jwt.len() as u64).unwrap();
+        let root = &report.root_nodes[0];
+
+        // Find the header part by kind, then verify its range slices the
+        // raw base64 header chunk out of the original (ws-prefixed) input.
+        let header = root
+            .children
+            .iter()
+            .find(|c| c.kind == "jwt_header")
+            .unwrap();
+        assert_eq!(slice_text(jwt, header.range), "eyJhbGciOiJIUzI1NiJ9");
+
+        let payload = root
+            .children
+            .iter()
+            .find(|c| c.kind == "jwt_payload")
+            .unwrap();
+        assert_eq!(slice_text(jwt, payload.range), "eyJzdWIiOiIxIn0");
+
+        let sig = root
+            .children
+            .iter()
+            .find(|c| c.kind == "jwt_signature")
+            .unwrap();
+        assert_eq!(slice_text(jwt, sig.range), "sig");
     }
 
     #[test]

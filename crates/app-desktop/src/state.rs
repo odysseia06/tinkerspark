@@ -598,6 +598,27 @@ impl AppState {
         }
     }
 
+    /// Apply a click on a structure-pane row (node header OR field row).
+    /// Updates the active analysis's `selected_node` / `selected_range` and
+    /// jumps the hex view to the clicked range. Hex jump is suppressed for
+    /// armored / decoded-content reports because their ranges aren't real
+    /// file offsets. Field clicks pass `(parent_node_id, field.range)` so
+    /// the parent stays selected while the hex view zooms to the field
+    /// bytes — this is the navigation feature requested by issue #5.
+    pub fn apply_structure_click(&mut self, node_id: NodeId, range: ByteRange) {
+        let Some(WorkspaceTab::File { file, analysis }) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let is_armored = analysis.as_ref().is_some_and(|a| a.armored);
+        if let Some(a) = analysis {
+            a.selected_node = Some(node_id);
+            a.selected_range = if is_armored { None } else { Some(range) };
+        }
+        if !is_armored {
+            file.hex.jump_to(range.offset());
+        }
+    }
+
     /// Persist session state to disk. Captures open file paths,
     /// active tab index, and dock layout.
     pub fn save_session_with_layout(&mut self, dock_layout: Option<serde_json::Value>) {
@@ -810,6 +831,44 @@ mod tests {
             _ => None,
         };
         state.tabs.push(WorkspaceTab::File { file, analysis });
+        state.active_tab = state.tabs.len() - 1;
+    }
+
+    /// Push a synthetic in-memory JWK tab so we can exercise the JWK
+    /// analyzer's field-span output. The handle's `kind` is set to
+    /// `JsonWebKey` so the registry routes to the dedicated analyzer
+    /// instead of the generic fallback.
+    fn push_synthetic_jwk(state: &mut AppState, json: &str) {
+        let file_len = json.len() as u64;
+        let handle = FileHandle {
+            id: FileId::new(),
+            path: PathBuf::from("synthetic.jwk"),
+            size: file_len,
+            kind: DetectedKind::JsonWebKey,
+        };
+        let source: Box<dyn ByteSource> = Box::new(MemoryByteSource::new(json.as_bytes().to_vec()));
+        let report = state
+            .registry
+            .auto_analyze(&handle, &*source)
+            .expect("registry should claim the JWK")
+            .expect("JWK should parse");
+        let file = OpenFile {
+            handle,
+            source,
+            backend: BackendKind::Buffered,
+            hex: HexViewState::new(file_len),
+            patches: PatchHistory::new(file_len),
+        };
+        state.tabs.push(WorkspaceTab::File {
+            file,
+            analysis: Some(AnalysisState {
+                report,
+                freshness: AnalysisFreshness::Fresh,
+                armored: false,
+                selected_node: None,
+                selected_range: None,
+            }),
+        });
         state.active_tab = state.tabs.len() - 1;
     }
 
@@ -1129,5 +1188,76 @@ mod tests {
         assert!(status.contains("Aggressive"), "status: {status}");
         assert!(status.contains("1 reanalyzed"), "status: {status}");
         assert!(status.contains("1 failed"), "status: {status}");
+    }
+
+    #[test]
+    fn jwk_field_click_drives_selected_range_and_hex_jump() {
+        // Issue #5: structure-pane field navigation. The JWK analyzer
+        // attaches per-field byte ranges; clicking a field row should set
+        // the active selected_range and jump the hex view to those bytes.
+        let mut state = AppState::with_session(SessionState::default());
+        let jwk = r#"{"kty":"RSA","n":"abc","e":"AQAB"}"#;
+        push_synthetic_jwk(&mut state, jwk);
+
+        // Locate the JWK node and the `e` field's range from the analysis.
+        let (jwk_node_id, e_range) = {
+            let analysis = state.active_analysis().expect("analysis present");
+            let jwk_node = &analysis.report.root_nodes[0];
+            assert_eq!(jwk_node.kind, "jwk");
+            let e_field = jwk_node
+                .fields
+                .iter()
+                .find(|f| f.name == "Exponent (e)")
+                .expect("Exponent field present");
+            (jwk_node.id, e_field.range.expect("exponent has a range"))
+        };
+
+        // Sanity: the range slices the right substring out of the source.
+        let start = e_range.offset() as usize;
+        let end = (e_range.offset() + e_range.length()) as usize;
+        assert_eq!(&jwk[start..end], "\"AQAB\"");
+
+        // Simulate the structure pane's click dispatch on the field row.
+        state.apply_structure_click(jwk_node_id, e_range);
+
+        // selected_range should follow the field span.
+        let analysis = state.active_analysis().expect("analysis present");
+        assert_eq!(analysis.selected_node, Some(jwk_node_id));
+        assert_eq!(analysis.selected_range, Some(e_range));
+
+        // The hex view's cursor / scroll target should be at the field offset.
+        let file = state.active_file().expect("file present");
+        assert_eq!(file.hex.cursor, e_range.offset());
+    }
+
+    #[test]
+    fn jwk_set_field_click_jumps_to_per_child_field_bytes() {
+        // For a JWK Set, clicking a field on a *non-first* child must jump
+        // to that child's bytes specifically — proves the per-child sub-
+        // index actually flows through the click pipeline.
+        let mut state = AppState::with_session(SessionState::default());
+        let jwks = r#"{"keys":[{"kty":"EC","crv":"P-256"},{"kty":"oct","k":"CCC"}]}"#;
+        push_synthetic_jwk(&mut state, jwks);
+
+        let (oct_node_id, k_range) = {
+            let analysis = state.active_analysis().unwrap();
+            let set = &analysis.report.root_nodes[0];
+            assert_eq!(set.kind, "jwk_set");
+            let oct = &set.children[1];
+            let k_field = oct
+                .fields
+                .iter()
+                .find(|f| f.name == "Symmetric key (k)")
+                .unwrap();
+            (oct.id, k_field.range.unwrap())
+        };
+        let start = k_range.offset() as usize;
+        let end = (k_range.offset() + k_range.length()) as usize;
+        assert_eq!(&jwks[start..end], "\"CCC\"");
+
+        state.apply_structure_click(oct_node_id, k_range);
+        let analysis = state.active_analysis().unwrap();
+        assert_eq!(analysis.selected_range, Some(k_range));
+        assert_eq!(state.active_file().unwrap().hex.cursor, k_range.offset());
     }
 }
