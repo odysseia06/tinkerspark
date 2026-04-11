@@ -95,7 +95,9 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
     let avail = ui.available_size();
     let visible_rows = ((avail.y / row_height) as usize).max(1);
 
-    file.hex.ensure_cursor_visible(visible_rows);
+    // Diff panes are navigated by scroll offsets and diff changes, not by
+    // the hex cursor. Forcing cursor visibility here pins large files to the
+    // initial cursor at byte 0 and prevents scrolling.
     let range = visible_range(file.hex.scroll_offset, visible_rows, bpr, file_len);
 
     // Read through the patch overlay so merged bytes are visible.
@@ -120,7 +122,7 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
     // Use allocate_rect + child UI instead of ScrollArea so scroll events
     // aren't consumed by a no-op ScrollArea before our manual handler.
     let hex_area = ui.available_rect_before_wrap();
-    let hex_response = ui.allocate_rect(hex_area, egui::Sense::hover());
+    let hex_response = ui.allocate_rect(hex_area, egui::Sense::click_and_drag());
 
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(hex_area));
     for row in &rows {
@@ -655,5 +657,90 @@ fn scroll_to_change(diff: &mut DiffSession, index: usize) {
             diff.left.hex.scroll_to_row(left_row);
             diff.right.hex.scroll_to_row(right_row);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+
+    use tinkerspark_core_bytes::{BackendKind, ByteSource, MemoryByteSource};
+    use tinkerspark_core_diff::{compute_diff, DiffConfig, DiffNavigator};
+    use tinkerspark_core_hexview::HexViewState;
+    use tinkerspark_core_patch::PatchHistory;
+    use tinkerspark_core_types::{DetectedKind, FileHandle, FileId};
+
+    use crate::state::{OpenFile, ScrollAuthority};
+
+    fn open_memory_file(name: &str, data: Vec<u8>) -> OpenFile {
+        let file_len = data.len() as u64;
+        let source: Box<dyn ByteSource> = Box::new(MemoryByteSource::new(data));
+        OpenFile {
+            handle: FileHandle {
+                id: FileId::new(),
+                path: PathBuf::from(name),
+                size: file_len,
+                kind: DetectedKind::Binary,
+            },
+            source,
+            backend: BackendKind::Buffered,
+            hex: HexViewState::new(file_len),
+            patches: PatchHistory::new(file_len),
+        }
+    }
+
+    fn large_fixture_diff() -> DiffSession {
+        let left = open_memory_file(
+            "large-left.bin",
+            include_bytes!("../../../testdata/diff/large-left.bin").to_vec(),
+        );
+        let right = open_memory_file(
+            "large-right.bin",
+            include_bytes!("../../../testdata/diff/large-right.bin").to_vec(),
+        );
+        let result = compute_diff(&*left.source, &*right.source, &DiffConfig::default()).unwrap();
+        let navigator = DiffNavigator::new(&result);
+
+        DiffSession {
+            left,
+            right,
+            result,
+            navigator,
+            sync_scroll: true,
+            scroll_authority: ScrollAuthority::Left,
+            last_merged_side: None,
+            merged_regions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_preserves_diff_scroll_when_cursor_is_above_viewport() {
+        let mut diff = large_fixture_diff();
+        diff.left.hex.scroll_to_row(512);
+        diff.right.hex.scroll_to_row(512);
+
+        let expected_left = diff.left.hex.scroll_offset;
+        let expected_right = diff.right.hex.scroll_offset;
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut status_message = None;
+
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_diff_tab(ui, &mut diff, &mut status_message);
+            });
+        });
+
+        assert_eq!(diff.left.hex.scroll_offset, expected_left);
+        assert_eq!(diff.right.hex.scroll_offset, expected_right);
     }
 }
