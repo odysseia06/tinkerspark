@@ -102,6 +102,13 @@ fn render_file_hex_view(
         return;
     }
 
+    // Disable egui's built-in label text-selection inside the hex view.
+    // Otherwise dragging over the offset gutter or ASCII column triggers
+    // egui's own glyph-background selection on top of our hex selection,
+    // and that highlight stays pinned to screen position when mouse-wheel
+    // scrolling shifts the underlying bytes.
+    ui.style_mut().interaction.selectable_labels = false;
+
     let patched = PatchedView::new(&*file.source, file.patches.patches());
 
     // Toolbar: jump-to-offset and search.

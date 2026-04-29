@@ -87,6 +87,11 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
         return;
     }
 
+    // Disable egui's built-in label text-selection (see hex_pane.rs for
+    // rationale: avoids competing highlights on the gutter/ASCII columns
+    // and stale selections after mouse-wheel scroll).
+    ui.style_mut().interaction.selectable_labels = false;
+
     // Layout metrics.
     let bpr = file.hex.bytes_per_row();
     let mono = egui::TextStyle::Monospace;
