@@ -144,17 +144,26 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
         );
     }
 
-    // Mouse scroll for virtual scrolling.
+    // Mouse scroll for virtual scrolling. Use raw_scroll_delta — smooth_scroll_delta
+    // is spread across ~4 smoothing frames, so a fixed-step trigger fires multiple
+    // times per wheel notch and overshoots.
     if hex_response.hovered() {
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
         if scroll_delta != 0.0 {
-            let scroll_rows = if scroll_delta > 0.0 { -3i64 } else { 3 };
+            let rows_f = scroll_delta / row_height;
+            let rows_delta = if rows_f.abs() < 1.0 {
+                rows_f.signum() as i64
+            } else {
+                rows_f.round() as i64
+            };
             let bpr64 = bpr as u64;
             let current_row = file.hex.scroll_offset / bpr64;
-            let new_row = if scroll_rows < 0 {
-                current_row.saturating_sub(scroll_rows.unsigned_abs())
+            let new_row = if rows_delta > 0 {
+                current_row.saturating_sub(rows_delta as u64)
+            } else if rows_delta < 0 {
+                current_row.saturating_add(rows_delta.unsigned_abs())
             } else {
-                current_row.saturating_add(scroll_rows as u64)
+                current_row
             };
             file.hex.scroll_to_row(new_row);
 
