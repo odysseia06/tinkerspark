@@ -129,8 +129,17 @@ fn render_file_hex_view(
     let char_width = ui.fonts(|f| f.glyph_width(&ui.style().text_styles[&mono], '0'));
     let row_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y;
 
-    let avail = ui.available_size();
-    let visible_rows = ((avail.y / row_height) as usize).max(1);
+    // Reserve a strip at the bottom for the selection status bar. Compute
+    // hex_area first so visible_rows is sized to what actually fits — otherwise
+    // build_rows emits an extra row that paints under the footer.
+    let sel_bar_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y * 2.0 + 4.0;
+    let full_area = ui.available_rect_before_wrap();
+    let hex_area = egui::Rect::from_min_max(
+        full_area.min,
+        egui::pos2(full_area.max.x, full_area.max.y - sel_bar_height),
+    );
+
+    let visible_rows = ((hex_area.height() / row_height) as usize).max(1);
 
     handle_keyboard(ui, &mut file.hex, visible_rows);
 
@@ -146,15 +155,6 @@ fn render_file_hex_view(
 
     let gutter_chars = offset_gutter_chars(file_len);
     let gutter_px = char_width * gutter_chars as f32 + 8.0;
-
-    // Reserve a strip at the bottom for the selection status bar so it
-    // doesn't get hidden behind the hex area's allocate_rect.
-    let sel_bar_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y * 2.0 + 4.0;
-    let full_area = ui.available_rect_before_wrap();
-    let hex_area = egui::Rect::from_min_max(
-        full_area.min,
-        egui::pos2(full_area.max.x, full_area.max.y - sel_bar_height),
-    );
 
     let hex_response = ui.allocate_rect(hex_area, egui::Sense::click_and_drag());
 
