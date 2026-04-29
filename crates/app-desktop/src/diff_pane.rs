@@ -96,9 +96,13 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
     let bpr = file.hex.bytes_per_row();
     let mono = egui::TextStyle::Monospace;
     let char_width = ui.fonts(|f| f.glyph_width(&ui.style().text_styles[&mono], '0'));
-    let row_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y;
-    let avail = ui.available_size();
-    let visible_rows = ((avail.y / row_height) as usize).max(1);
+    let row_height = ui
+        .text_style_height(&mono)
+        .max(ui.spacing().interact_size.y)
+        + ui.spacing().item_spacing.y;
+    let viewport_area = ui.available_rect_before_wrap();
+    let (hex_area, scrollbar_area) = crate::hex_pane::split_viewport_for_scrollbar(viewport_area);
+    let visible_rows = ((hex_area.height() / row_height) as usize).max(1);
 
     // Diff panes are navigated by scroll offsets and diff changes, not by
     // the hex cursor. Forcing cursor visibility here pins large files to the
@@ -126,10 +130,10 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
 
     // Use allocate_rect + child UI instead of ScrollArea so scroll events
     // aren't consumed by a no-op ScrollArea before our manual handler.
-    let hex_area = ui.available_rect_before_wrap();
-    let hex_response = ui.allocate_rect(hex_area, egui::Sense::click_and_drag());
+    let _hex_response = ui.allocate_rect(hex_area, egui::Sense::click_and_drag());
 
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(hex_area));
+    child.set_clip_rect(hex_area);
     for row in &rows {
         render_diff_row(
             &mut child,
@@ -144,13 +148,38 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
         );
     }
 
-    // Mouse scroll for virtual scrolling. Use raw_scroll_delta — smooth_scroll_delta
-    // is spread across ~4 smoothing frames, so a fixed-step trigger fires multiple
-    // times per wheel notch and overshoots.
-    if hex_response.hovered() {
-        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+    // Vertical scrollbar on the right edge of this side's viewport.
+    let scrollbar_id = match side {
+        DiffSide::Left => "diff_scrollbar_left",
+        DiffSide::Right => "diff_scrollbar_right",
+    };
+    let pre_scrollbar_offset = file.hex.scroll_offset;
+    crate::hex_pane::render_vertical_scrollbar(
+        ui,
+        scrollbar_area,
+        &mut file.hex,
+        bpr,
+        visible_rows,
+        file_len,
+        scrollbar_id,
+    );
+    if file.hex.scroll_offset != pre_scrollbar_offset {
+        diff.scroll_authority = match side {
+            DiffSide::Left => crate::state::ScrollAuthority::Left,
+            DiffSide::Right => crate::state::ScrollAuthority::Right,
+        };
+    }
+
+    // Mouse scroll for virtual scrolling. Hover-detect across the whole viewport
+    // so the wheel works while hovering the scrollbar too. Ctrl multiplies speed.
+    let pointer_in_viewport = ui
+        .input(|i| i.pointer.interact_pos())
+        .is_some_and(|pos| viewport_area.contains(pos));
+    if pointer_in_viewport {
+        let (scroll_delta, ctrl) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta != 0.0 {
-            let rows_f = scroll_delta / row_height;
+            let multiplier = if ctrl { 10.0 } else { 1.0 };
+            let rows_f = (scroll_delta * multiplier) / row_height;
             let rows_delta = if rows_f.abs() < 1.0 {
                 rows_f.signum() as i64
             } else {

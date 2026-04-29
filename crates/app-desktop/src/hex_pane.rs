@@ -165,7 +165,8 @@ fn render_file_hex_view(
         .max(ui.spacing().interact_size.y)
         + ui.spacing().item_spacing.y;
 
-    let hex_area = ui.available_rect_before_wrap();
+    let viewport_area = ui.available_rect_before_wrap();
+    let (hex_area, scrollbar_area) = split_viewport_for_scrollbar(viewport_area);
     let visible_rows = ((hex_area.height() / row_height) as usize).max(1);
 
     handle_keyboard(ui, &mut file.hex, visible_rows);
@@ -202,13 +203,29 @@ fn render_file_hex_view(
         row_rects.push(rect);
     }
 
+    // Vertical scrollbar on the right edge of the viewport.
+    render_vertical_scrollbar(
+        ui,
+        scrollbar_area,
+        &mut file.hex,
+        bpr,
+        visible_rows,
+        file_len,
+        "hex_pane_scrollbar",
+    );
+
     // Mouse scroll for virtual scrolling. Use raw_scroll_delta — smooth_scroll_delta
     // is spread across ~4 smoothing frames, so a fixed-step trigger fires multiple
-    // times per wheel notch and overshoots.
-    if hex_response.hovered() {
-        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+    // times per wheel notch and overshoots. Hover-detect across the whole viewport
+    // (hex_area + scrollbar_area) so the wheel works while hovering the bar too.
+    let pointer_in_viewport = ui
+        .input(|i| i.pointer.interact_pos())
+        .is_some_and(|pos| viewport_area.contains(pos));
+    if pointer_in_viewport {
+        let (scroll_delta, ctrl) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta != 0.0 {
-            let rows_f = scroll_delta / row_height;
+            let multiplier = if ctrl { 10.0 } else { 1.0 };
+            let rows_f = (scroll_delta * multiplier) / row_height;
             let rows_delta = if rows_f.abs() < 1.0 {
                 rows_f.signum() as i64
             } else {
@@ -547,6 +564,79 @@ fn handle_keyboard(
     if hex.cursor != old_cursor {
         hex.ensure_cursor_visible(visible_rows);
     }
+}
+
+pub(crate) const SCROLLBAR_WIDTH: f32 = 14.0;
+
+/// Split a viewport into (hex_area, scrollbar_area) along the right edge.
+pub(crate) fn split_viewport_for_scrollbar(viewport: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let split_x = (viewport.max.x - SCROLLBAR_WIDTH).max(viewport.min.x);
+    let hex_area = egui::Rect::from_min_max(viewport.min, egui::pos2(split_x, viewport.max.y));
+    let scrollbar_area =
+        egui::Rect::from_min_max(egui::pos2(split_x, viewport.min.y), viewport.max);
+    (hex_area, scrollbar_area)
+}
+
+/// Render a vertical scrollbar that maps the file's first-visible-row to the
+/// thumb position. Click-and-drag anywhere on the track snaps the thumb's
+/// center under the pointer, so any reachable byte is at most one drag away.
+pub(crate) fn render_vertical_scrollbar(
+    ui: &mut Ui,
+    track_rect: egui::Rect,
+    hex: &mut tinkerspark_core_hexview::HexViewState,
+    bpr: usize,
+    visible_rows: usize,
+    file_len: u64,
+    id_source: &str,
+) {
+    if track_rect.width() <= 0.0 || track_rect.height() <= 0.0 {
+        return;
+    }
+
+    let bpr64 = bpr as u64;
+    let total_rows = file_len.div_ceil(bpr64).max(1);
+    let max_first_row = total_rows.saturating_sub(visible_rows as u64);
+    let current_first_row = (hex.scroll_offset / bpr64).min(max_first_row);
+
+    let painter = ui.painter_at(track_rect);
+    painter.rect_filled(track_rect, 2.0, ui.visuals().extreme_bg_color);
+
+    let thumb_height_ratio = (visible_rows as f32 / total_rows as f32).clamp(0.06, 1.0);
+    let thumb_height = (track_rect.height() * thumb_height_ratio).max(20.0);
+    let track_drag_range = (track_rect.height() - thumb_height).max(0.0);
+
+    let thumb_pos_ratio = if max_first_row > 0 {
+        current_first_row as f32 / max_first_row as f32
+    } else {
+        0.0
+    };
+    let thumb_y = track_rect.min.y + thumb_pos_ratio * track_drag_range;
+    let thumb_rect = egui::Rect::from_min_size(
+        egui::pos2(track_rect.min.x + 2.0, thumb_y),
+        egui::vec2((track_rect.width() - 4.0).max(1.0), thumb_height),
+    );
+
+    let id = ui.id().with(id_source);
+    let response = ui.interact(track_rect, id, egui::Sense::click_and_drag());
+
+    if response.is_pointer_button_down_on() && max_first_row > 0 && track_drag_range > 0.0 {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let target_top = pos.y - thumb_height / 2.0;
+            let pointer_ratio =
+                ((target_top - track_rect.min.y) / track_drag_range).clamp(0.0, 1.0);
+            let new_first_row = (pointer_ratio * max_first_row as f32).round() as u64;
+            hex.scroll_to_row(new_first_row);
+        }
+    }
+
+    let thumb_color = if response.is_pointer_button_down_on() {
+        Color32::from_rgb(190, 190, 190)
+    } else if response.hovered() {
+        Color32::from_rgb(140, 140, 140)
+    } else {
+        Color32::from_rgb(90, 90, 90)
+    };
+    painter.rect_filled(thumb_rect, 3.0, thumb_color);
 }
 
 fn render_selection_status(ui: &mut Ui, meta: &SelectionMeta) {
