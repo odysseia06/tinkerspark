@@ -111,6 +111,36 @@ fn render_file_hex_view(
 
     let patched = PatchedView::new(&*file.source, file.patches.patches());
 
+    // Compute selection metadata up-front so the bottom panel can render it
+    // without re-borrowing file. Displayed selection is one frame behind
+    // (drag handlers run later), which is imperceptible at 60fps and lets us
+    // reserve the panel's space before the grid claims its area.
+    let sel_meta: Option<SelectionMeta> = file.hex.selection.as_ref().and_then(|sel| {
+        let sel_range = ByteRange::new(sel.start(), sel.len());
+        patched
+            .read_range(sel_range)
+            .ok()
+            .map(|bytes| SelectionMeta::from_bytes(sel, &bytes))
+    });
+
+    // Selection status bar — TopBottomPanel reserves the bottom strip
+    // cleanly. Doing this before the grid means ui.available_rect_before_wrap()
+    // below excludes the panel, so the hex grid can never paint under it.
+    egui::TopBottomPanel::bottom("hex_selection_status")
+        .resizable(false)
+        .show_inside(ui, |ui| {
+            if let Some(meta) = &sel_meta {
+                render_selection_status(ui, meta);
+            } else {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("No selection")
+                        .text_style(egui::TextStyle::Monospace)
+                        .color(Color32::from_rgb(120, 120, 120)),
+                );
+            }
+        });
+
     // Toolbar: jump-to-offset and search.
     render_toolbar(
         ui,
@@ -127,18 +157,15 @@ fn render_file_hex_view(
     let bpr = file.hex.bytes_per_row();
     let mono = egui::TextStyle::Monospace;
     let char_width = ui.fonts(|f| f.glyph_width(&ui.style().text_styles[&mono], '0'));
-    let row_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y;
+    // ui.horizontal allocates max(content_height, interact_size.y) per row, so
+    // monospace text height alone underestimates the row pitch and visible_rows
+    // ends up too large.
+    let row_height = ui
+        .text_style_height(&mono)
+        .max(ui.spacing().interact_size.y)
+        + ui.spacing().item_spacing.y;
 
-    // Reserve a strip at the bottom for the selection status bar. Compute
-    // hex_area first so visible_rows is sized to what actually fits — otherwise
-    // build_rows emits an extra row that paints under the footer.
-    let sel_bar_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y * 2.0 + 4.0;
-    let full_area = ui.available_rect_before_wrap();
-    let hex_area = egui::Rect::from_min_max(
-        full_area.min,
-        egui::pos2(full_area.max.x, full_area.max.y - sel_bar_height),
-    );
-
+    let hex_area = ui.available_rect_before_wrap();
     let visible_rows = ((hex_area.height() / row_height) as usize).max(1);
 
     handle_keyboard(ui, &mut file.hex, visible_rows);
@@ -160,6 +187,9 @@ fn render_file_hex_view(
 
     let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(rows.len());
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(hex_area));
+    // max_rect is a layout hint, not a paint clip. Without this any row whose
+    // pitch we underestimated will paint into the bottom status panel.
+    child.set_clip_rect(hex_area);
     for row in &rows {
         let rect = render_row(
             &mut child,
@@ -220,15 +250,6 @@ fn render_file_hex_view(
 
     if ui.input(|i| i.pointer.any_released()) {
         file.hex.end_drag();
-    }
-
-    if let Some(sel) = &file.hex.selection {
-        let sel_range = ByteRange::new(sel.start(), sel.len());
-        let patched_for_sel = PatchedView::new(&*file.source, file.patches.patches());
-        if let Ok(sel_bytes) = patched_for_sel.read_range(sel_range) {
-            let meta = SelectionMeta::from_bytes(sel, &sel_bytes);
-            render_selection_status(ui, &meta);
-        }
     }
 }
 
@@ -520,7 +541,6 @@ fn handle_keyboard(
 }
 
 fn render_selection_status(ui: &mut Ui, meta: &SelectionMeta) {
-    ui.separator();
     ui.horizontal_wrapped(|ui| {
         let mono = egui::TextStyle::Monospace;
         ui.label(
