@@ -102,7 +102,44 @@ fn render_file_hex_view(
         return;
     }
 
+    // Disable egui's built-in label text-selection inside the hex view.
+    // Otherwise dragging over the offset gutter or ASCII column triggers
+    // egui's own glyph-background selection on top of our hex selection,
+    // and that highlight stays pinned to screen position when mouse-wheel
+    // scrolling shifts the underlying bytes.
+    ui.style_mut().interaction.selectable_labels = false;
+
     let patched = PatchedView::new(&*file.source, file.patches.patches());
+
+    // Compute selection metadata up-front so the bottom panel can render it
+    // without re-borrowing file. Displayed selection is one frame behind
+    // (drag handlers run later), which is imperceptible at 60fps and lets us
+    // reserve the panel's space before the grid claims its area.
+    let sel_meta: Option<SelectionMeta> = file.hex.selection.as_ref().and_then(|sel| {
+        let sel_range = ByteRange::new(sel.start(), sel.len());
+        patched
+            .read_range(sel_range)
+            .ok()
+            .map(|bytes| SelectionMeta::from_bytes(sel, &bytes))
+    });
+
+    // Selection status bar — TopBottomPanel reserves the bottom strip
+    // cleanly. Doing this before the grid means ui.available_rect_before_wrap()
+    // below excludes the panel, so the hex grid can never paint under it.
+    egui::TopBottomPanel::bottom("hex_selection_status")
+        .resizable(false)
+        .show_inside(ui, |ui| {
+            if let Some(meta) = &sel_meta {
+                render_selection_status(ui, meta);
+            } else {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("No selection")
+                        .text_style(egui::TextStyle::Monospace)
+                        .color(Color32::from_rgb(120, 120, 120)),
+                );
+            }
+        });
 
     // Toolbar: jump-to-offset and search.
     render_toolbar(
@@ -120,10 +157,17 @@ fn render_file_hex_view(
     let bpr = file.hex.bytes_per_row();
     let mono = egui::TextStyle::Monospace;
     let char_width = ui.fonts(|f| f.glyph_width(&ui.style().text_styles[&mono], '0'));
-    let row_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y;
+    // ui.horizontal allocates max(content_height, interact_size.y) per row, so
+    // monospace text height alone underestimates the row pitch and visible_rows
+    // ends up too large.
+    let row_height = ui
+        .text_style_height(&mono)
+        .max(ui.spacing().interact_size.y)
+        + ui.spacing().item_spacing.y;
 
-    let avail = ui.available_size();
-    let visible_rows = ((avail.y / row_height) as usize).max(1);
+    let viewport_area = ui.available_rect_before_wrap();
+    let (hex_area, scrollbar_area) = split_viewport_for_scrollbar(viewport_area);
+    let visible_rows = ((hex_area.height() / row_height) as usize).max(1);
 
     handle_keyboard(ui, &mut file.hex, visible_rows);
 
@@ -140,19 +184,13 @@ fn render_file_hex_view(
     let gutter_chars = offset_gutter_chars(file_len);
     let gutter_px = char_width * gutter_chars as f32 + 8.0;
 
-    // Reserve a strip at the bottom for the selection status bar so it
-    // doesn't get hidden behind the hex area's allocate_rect.
-    let sel_bar_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y * 2.0 + 4.0;
-    let full_area = ui.available_rect_before_wrap();
-    let hex_area = egui::Rect::from_min_max(
-        full_area.min,
-        egui::pos2(full_area.max.x, full_area.max.y - sel_bar_height),
-    );
-
     let hex_response = ui.allocate_rect(hex_area, egui::Sense::click_and_drag());
 
     let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(rows.len());
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(hex_area));
+    // max_rect is a layout hint, not a paint clip. Without this any row whose
+    // pitch we underestimated will paint into the bottom status panel.
+    child.set_clip_rect(hex_area);
     for row in &rows {
         let rect = render_row(
             &mut child,
@@ -165,17 +203,42 @@ fn render_file_hex_view(
         row_rects.push(rect);
     }
 
-    // Mouse scroll for virtual scrolling.
-    if hex_response.hovered() {
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+    // Vertical scrollbar on the right edge of the viewport.
+    render_vertical_scrollbar(
+        ui,
+        scrollbar_area,
+        &mut file.hex,
+        bpr,
+        visible_rows,
+        file_len,
+        "hex_pane_scrollbar",
+    );
+
+    // Mouse scroll for virtual scrolling. Use raw_scroll_delta — smooth_scroll_delta
+    // is spread across ~4 smoothing frames, so a fixed-step trigger fires multiple
+    // times per wheel notch and overshoots. Gate on the whole viewport
+    // (hex_area + scrollbar_area) so the wheel works while hovering the bar too.
+    // rect_contains_pointer (not a raw geometric contains) is layer-aware: it
+    // returns false when a floating Window (edit dialog, command palette) sits
+    // over the grid, so scrolling that dialog no longer moves the file behind it.
+    if ui.rect_contains_pointer(viewport_area) {
+        let (scroll_delta, ctrl) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta != 0.0 {
-            let scroll_rows = if scroll_delta > 0.0 { -3i64 } else { 3 };
+            let multiplier = if ctrl { 10.0 } else { 1.0 };
+            let rows_f = (scroll_delta * multiplier) / row_height;
+            let rows_delta = if rows_f.abs() < 1.0 {
+                rows_f.signum() as i64
+            } else {
+                rows_f.round() as i64
+            };
             let bpr64 = bpr as u64;
             let current_row = file.hex.scroll_offset / bpr64;
-            let new_row = if scroll_rows < 0 {
-                current_row.saturating_sub(scroll_rows.unsigned_abs())
+            let new_row = if rows_delta > 0 {
+                current_row.saturating_sub(rows_delta as u64)
+            } else if rows_delta < 0 {
+                current_row.saturating_add(rows_delta.unsigned_abs())
             } else {
-                current_row.saturating_add(scroll_rows as u64)
+                current_row
             };
             file.hex.scroll_to_row(new_row);
         }
@@ -213,15 +276,6 @@ fn render_file_hex_view(
 
     if ui.input(|i| i.pointer.any_released()) {
         file.hex.end_drag();
-    }
-
-    if let Some(sel) = &file.hex.selection {
-        let sel_range = ByteRange::new(sel.start(), sel.len());
-        let patched_for_sel = PatchedView::new(&*file.source, file.patches.patches());
-        if let Ok(sel_bytes) = patched_for_sel.read_range(sel_range) {
-            let meta = SelectionMeta::from_bytes(sel, &sel_bytes);
-            render_selection_status(ui, &meta);
-        }
     }
 }
 
@@ -512,8 +566,80 @@ fn handle_keyboard(
     }
 }
 
+pub(crate) const SCROLLBAR_WIDTH: f32 = 14.0;
+
+/// Split a viewport into (hex_area, scrollbar_area) along the right edge.
+pub(crate) fn split_viewport_for_scrollbar(viewport: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let split_x = (viewport.max.x - SCROLLBAR_WIDTH).max(viewport.min.x);
+    let hex_area = egui::Rect::from_min_max(viewport.min, egui::pos2(split_x, viewport.max.y));
+    let scrollbar_area =
+        egui::Rect::from_min_max(egui::pos2(split_x, viewport.min.y), viewport.max);
+    (hex_area, scrollbar_area)
+}
+
+/// Render a vertical scrollbar that maps the file's first-visible-row to the
+/// thumb position. Click-and-drag anywhere on the track snaps the thumb's
+/// center under the pointer, so any reachable byte is at most one drag away.
+pub(crate) fn render_vertical_scrollbar(
+    ui: &mut Ui,
+    track_rect: egui::Rect,
+    hex: &mut tinkerspark_core_hexview::HexViewState,
+    bpr: usize,
+    visible_rows: usize,
+    file_len: u64,
+    id_source: &str,
+) {
+    if track_rect.width() <= 0.0 || track_rect.height() <= 0.0 {
+        return;
+    }
+
+    let bpr64 = bpr as u64;
+    let total_rows = file_len.div_ceil(bpr64).max(1);
+    let max_first_row = total_rows.saturating_sub(visible_rows as u64);
+    let current_first_row = (hex.scroll_offset / bpr64).min(max_first_row);
+
+    let painter = ui.painter_at(track_rect);
+    painter.rect_filled(track_rect, 2.0, ui.visuals().extreme_bg_color);
+
+    let thumb_height_ratio = (visible_rows as f32 / total_rows as f32).clamp(0.06, 1.0);
+    let thumb_height = (track_rect.height() * thumb_height_ratio).max(20.0);
+    let track_drag_range = (track_rect.height() - thumb_height).max(0.0);
+
+    let thumb_pos_ratio = if max_first_row > 0 {
+        current_first_row as f32 / max_first_row as f32
+    } else {
+        0.0
+    };
+    let thumb_y = track_rect.min.y + thumb_pos_ratio * track_drag_range;
+    let thumb_rect = egui::Rect::from_min_size(
+        egui::pos2(track_rect.min.x + 2.0, thumb_y),
+        egui::vec2((track_rect.width() - 4.0).max(1.0), thumb_height),
+    );
+
+    let id = ui.id().with(id_source);
+    let response = ui.interact(track_rect, id, egui::Sense::click_and_drag());
+
+    if response.is_pointer_button_down_on() && max_first_row > 0 && track_drag_range > 0.0 {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let target_top = pos.y - thumb_height / 2.0;
+            let pointer_ratio =
+                ((target_top - track_rect.min.y) / track_drag_range).clamp(0.0, 1.0);
+            let new_first_row = (pointer_ratio * max_first_row as f32).round() as u64;
+            hex.scroll_to_row(new_first_row);
+        }
+    }
+
+    let thumb_color = if response.is_pointer_button_down_on() {
+        Color32::from_rgb(190, 190, 190)
+    } else if response.hovered() {
+        Color32::from_rgb(140, 140, 140)
+    } else {
+        Color32::from_rgb(90, 90, 90)
+    };
+    painter.rect_filled(thumb_rect, 3.0, thumb_color);
+}
+
 fn render_selection_status(ui: &mut Ui, meta: &SelectionMeta) {
-    ui.separator();
     ui.horizontal_wrapped(|ui| {
         let mono = egui::TextStyle::Monospace;
         ui.label(

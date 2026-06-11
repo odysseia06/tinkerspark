@@ -58,8 +58,11 @@ impl TinkersparkApp {
 fn build_default_layout() -> DockState<PaneKind> {
     let mut dock = DockState::new(vec![PaneKind::Hex]);
 
+    // Editor takes 85% of width so a side-by-side diff has room for both
+    // panes at the standard 16 bpr on typical 1440px+ windows; structure and
+    // metadata stack on the narrow right column.
     let surface = dock.main_surface_mut();
-    let [_left, right] = surface.split_right(NodeIndex::root(), 0.65, vec![PaneKind::Metadata]);
+    let [_left, right] = surface.split_right(NodeIndex::root(), 0.85, vec![PaneKind::Metadata]);
     surface.split_below(right, 0.5, vec![PaneKind::Structure]);
 
     let [_main, _bottom] = surface.split_below(

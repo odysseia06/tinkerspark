@@ -43,10 +43,24 @@ pub fn render_diff_tab(ui: &mut Ui, diff: &mut DiffSession, status_message: &mut
                 });
         });
 
-    // Left/right hex views side by side in the remaining space.
+    // Split the editor pane 50/50 between left and right at a fixed divider
+    // (no draggable splitter — see the user-facing rationale: it removes a
+    // moving part that has no useful effect once the panes are sized to fit).
+    let half_width = ui.available_width() * 0.5;
+
+    // Both sides share a bytes-per-row computed from the now-known half width,
+    // so rows line up visually and never overflow the panel boundary.
+    let mono = egui::TextStyle::Monospace;
+    let char_width = ui.fonts(|f| f.glyph_width(&ui.style().text_styles[&mono], '0'));
+    let largest_file = diff.left.source.len().max(diff.right.source.len());
+    let gutter_chars = offset_gutter_chars(largest_file);
+    let display_bpr = compute_display_bpr(half_width, char_width, gutter_chars);
+    diff.left.hex.config.bytes_per_row = display_bpr;
+    diff.right.hex.config.bytes_per_row = display_bpr;
+
     egui::SidePanel::left("diff_left_panel")
-        .resizable(true)
-        .default_width(ui.available_width() * 0.5)
+        .resizable(false)
+        .exact_width(half_width)
         .show_inside(ui, |ui| {
             render_diff_hex_side(ui, diff, DiffSide::Left);
         });
@@ -54,6 +68,40 @@ pub fn render_diff_tab(ui: &mut Ui, diff: &mut DiffSession, status_message: &mut
     egui::CentralPanel::default().show_inside(ui, |ui| {
         render_diff_hex_side(ui, diff, DiffSide::Right);
     });
+}
+
+/// Largest power-of-two bpr in {4, 8, 16, 32} that fits in `panel_width`.
+///
+/// Per-row layout cost: gutter + bpr*(2 hex chars + 1 ASCII char + 2 inter-widget
+/// spacings) + group separator (4px every 8 bytes after the first) + 12px gap
+/// between hex and ASCII + 14px scrollbar + an inset/safety pad covering the
+/// SidePanel's frame and a small margin against rounding error.
+fn compute_display_bpr(panel_width: f32, char_width: f32, gutter_chars: usize) -> usize {
+    if panel_width <= 0.0 || char_width <= 0.0 {
+        return 16;
+    }
+
+    let item_spacing = 4.0_f32;
+    let scrollbar = 14.0;
+    let mid_gap = 12.0;
+    let inset_safety = 24.0;
+    let gutter_px = gutter_chars as f32 * char_width + 8.0;
+    let per_byte = 3.0 * char_width + 2.0 * item_spacing;
+
+    let needed = |bpr: usize| -> f32 {
+        let group_pad = (bpr / 8).saturating_sub(1) as f32 * item_spacing;
+        gutter_px + per_byte * bpr as f32 + group_pad + mid_gap + scrollbar + inset_safety
+    };
+
+    if panel_width >= needed(32) {
+        32
+    } else if panel_width >= needed(16) {
+        16
+    } else if panel_width >= needed(8) {
+        8
+    } else {
+        4
+    }
 }
 
 /// Render one side of the diff hex view.
@@ -71,14 +119,22 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
 
     let file_len = file.source.len();
 
-    // File header.
+    // Disable egui's built-in label text-selection (see hex_pane.rs for
+    // rationale: avoids competing highlights on the gutter/ASCII columns
+    // and stale selections after mouse-wheel scroll). Set before the header and
+    // the empty-file early-out so those labels match the rest of the view.
+    ui.style_mut().interaction.selectable_labels = false;
+
+    // File header. The path can be long; truncate with ellipsis and show the
+    // full path on hover so the side label never gets pushed off-panel.
     ui.horizontal(|ui| {
         let side_label = match side {
             DiffSide::Left => "Left:",
             DiffSide::Right => "Right:",
         };
         ui.strong(side_label);
-        ui.label(&file_label);
+        ui.add(egui::Label::new(&file_label).truncate())
+            .on_hover_text(&file_label);
     });
     ui.separator();
 
@@ -91,9 +147,13 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
     let bpr = file.hex.bytes_per_row();
     let mono = egui::TextStyle::Monospace;
     let char_width = ui.fonts(|f| f.glyph_width(&ui.style().text_styles[&mono], '0'));
-    let row_height = ui.text_style_height(&mono) + ui.spacing().item_spacing.y;
-    let avail = ui.available_size();
-    let visible_rows = ((avail.y / row_height) as usize).max(1);
+    let row_height = ui
+        .text_style_height(&mono)
+        .max(ui.spacing().interact_size.y)
+        + ui.spacing().item_spacing.y;
+    let viewport_area = ui.available_rect_before_wrap();
+    let (hex_area, scrollbar_area) = crate::hex_pane::split_viewport_for_scrollbar(viewport_area);
+    let visible_rows = ((hex_area.height() / row_height) as usize).max(1);
 
     // Diff panes are navigated by scroll offsets and diff changes, not by
     // the hex cursor. Forcing cursor visibility here pins large files to the
@@ -121,10 +181,10 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
 
     // Use allocate_rect + child UI instead of ScrollArea so scroll events
     // aren't consumed by a no-op ScrollArea before our manual handler.
-    let hex_area = ui.available_rect_before_wrap();
-    let hex_response = ui.allocate_rect(hex_area, egui::Sense::click_and_drag());
+    let _hex_response = ui.allocate_rect(hex_area, egui::Sense::click_and_drag());
 
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(hex_area));
+    child.set_clip_rect(hex_area);
     for row in &rows {
         render_diff_row(
             &mut child,
@@ -139,17 +199,50 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
         );
     }
 
-    // Mouse scroll for virtual scrolling.
-    if hex_response.hovered() {
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+    // Vertical scrollbar on the right edge of this side's viewport.
+    let scrollbar_id = match side {
+        DiffSide::Left => "diff_scrollbar_left",
+        DiffSide::Right => "diff_scrollbar_right",
+    };
+    let pre_scrollbar_offset = file.hex.scroll_offset;
+    crate::hex_pane::render_vertical_scrollbar(
+        ui,
+        scrollbar_area,
+        &mut file.hex,
+        bpr,
+        visible_rows,
+        file_len,
+        scrollbar_id,
+    );
+    if file.hex.scroll_offset != pre_scrollbar_offset {
+        diff.scroll_authority = match side {
+            DiffSide::Left => crate::state::ScrollAuthority::Left,
+            DiffSide::Right => crate::state::ScrollAuthority::Right,
+        };
+    }
+
+    // Mouse scroll for virtual scrolling. Gate on the whole viewport so the wheel
+    // works while hovering the scrollbar too. Ctrl multiplies speed.
+    // rect_contains_pointer is layer-aware (see hex_pane.rs): it returns false
+    // when a floating Window covers this side, so the grid behind it stays put.
+    if ui.rect_contains_pointer(viewport_area) {
+        let (scroll_delta, ctrl) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta != 0.0 {
-            let scroll_rows = if scroll_delta > 0.0 { -3i64 } else { 3 };
+            let multiplier = if ctrl { 10.0 } else { 1.0 };
+            let rows_f = (scroll_delta * multiplier) / row_height;
+            let rows_delta = if rows_f.abs() < 1.0 {
+                rows_f.signum() as i64
+            } else {
+                rows_f.round() as i64
+            };
             let bpr64 = bpr as u64;
             let current_row = file.hex.scroll_offset / bpr64;
-            let new_row = if scroll_rows < 0 {
-                current_row.saturating_sub(scroll_rows.unsigned_abs())
+            let new_row = if rows_delta > 0 {
+                current_row.saturating_sub(rows_delta as u64)
+            } else if rows_delta < 0 {
+                current_row.saturating_add(rows_delta.unsigned_abs())
             } else {
-                current_row.saturating_add(scroll_rows as u64)
+                current_row
             };
             file.hex.scroll_to_row(new_row);
 
