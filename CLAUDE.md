@@ -80,6 +80,20 @@ crates/
 - Finish with `cargo fmt`, `cargo check`, and `cargo test`.
 - Use available Rust skills and MCP tools (rust-analyzer, coding-guidelines, etc.) proactively when writing or reviewing code.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs live in this repo's GitHub Issues, managed via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles mapped to like-named labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
