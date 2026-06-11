@@ -119,6 +119,12 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
 
     let file_len = file.source.len();
 
+    // Disable egui's built-in label text-selection (see hex_pane.rs for
+    // rationale: avoids competing highlights on the gutter/ASCII columns
+    // and stale selections after mouse-wheel scroll). Set before the header and
+    // the empty-file early-out so those labels match the rest of the view.
+    ui.style_mut().interaction.selectable_labels = false;
+
     // File header. The path can be long; truncate with ellipsis and show the
     // full path on hover so the side label never gets pushed off-panel.
     ui.horizontal(|ui| {
@@ -136,11 +142,6 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
         ui.label("(empty file)");
         return;
     }
-
-    // Disable egui's built-in label text-selection (see hex_pane.rs for
-    // rationale: avoids competing highlights on the gutter/ASCII columns
-    // and stale selections after mouse-wheel scroll).
-    ui.style_mut().interaction.selectable_labels = false;
 
     // Layout metrics.
     let bpr = file.hex.bytes_per_row();
@@ -220,12 +221,11 @@ fn render_diff_hex_side(ui: &mut Ui, diff: &mut DiffSession, side: DiffSide) {
         };
     }
 
-    // Mouse scroll for virtual scrolling. Hover-detect across the whole viewport
-    // so the wheel works while hovering the scrollbar too. Ctrl multiplies speed.
-    let pointer_in_viewport = ui
-        .input(|i| i.pointer.interact_pos())
-        .is_some_and(|pos| viewport_area.contains(pos));
-    if pointer_in_viewport {
+    // Mouse scroll for virtual scrolling. Gate on the whole viewport so the wheel
+    // works while hovering the scrollbar too. Ctrl multiplies speed.
+    // rect_contains_pointer is layer-aware (see hex_pane.rs): it returns false
+    // when a floating Window covers this side, so the grid behind it stays put.
+    if ui.rect_contains_pointer(viewport_area) {
         let (scroll_delta, ctrl) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta != 0.0 {
             let multiplier = if ctrl { 10.0 } else { 1.0 };

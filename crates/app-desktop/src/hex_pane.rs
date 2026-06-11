@@ -216,12 +216,12 @@ fn render_file_hex_view(
 
     // Mouse scroll for virtual scrolling. Use raw_scroll_delta — smooth_scroll_delta
     // is spread across ~4 smoothing frames, so a fixed-step trigger fires multiple
-    // times per wheel notch and overshoots. Hover-detect across the whole viewport
+    // times per wheel notch and overshoots. Gate on the whole viewport
     // (hex_area + scrollbar_area) so the wheel works while hovering the bar too.
-    let pointer_in_viewport = ui
-        .input(|i| i.pointer.interact_pos())
-        .is_some_and(|pos| viewport_area.contains(pos));
-    if pointer_in_viewport {
+    // rect_contains_pointer (not a raw geometric contains) is layer-aware: it
+    // returns false when a floating Window (edit dialog, command palette) sits
+    // over the grid, so scrolling that dialog no longer moves the file behind it.
+    if ui.rect_contains_pointer(viewport_area) {
         let (scroll_delta, ctrl) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll_delta != 0.0 {
             let multiplier = if ctrl { 10.0 } else { 1.0 };
